@@ -54,6 +54,7 @@ Coverage is still incomplete. The project is driven by real examples, so unsuppo
 - [fortran_runtime.h](fortran_runtime.h): shared runtime declarations
 - [xc_post.py](xc_post.py): conservative C readability cleanup
 - [xnormalize.py](xnormalize.py): output normalization used by `--pretty`
+- [xf2c_batch.py](xf2c_batch.py): cross-platform runner for many Fortran files
 
 ## Basic Usage
 
@@ -171,6 +172,38 @@ If you want one standalone generated C file:
 
 ```cmd
 python xf2c.py xread.f90 --single-file
+```
+
+## Running Many Examples
+
+Run several files directly:
+
+```cmd
+python xf2c_batch.py xhello.f90 xlogical.f90
+```
+
+Use an optional manifest file:
+
+```cmd
+python xf2c_batch.py --file-list fortran_files.txt
+```
+
+Limit how many files are processed:
+
+```cmd
+python xf2c_batch.py --file-list fortran_files.txt --limit 5
+```
+
+The default `xf2c.py` options used by the batch runner are:
+
+```text
+--run-both --tee
+```
+
+Override them if needed:
+
+```cmd
+python xf2c_batch.py xhello.f90 --opts "--compile"
 ```
 
 ## What Works Well Today
