@@ -484,6 +484,7 @@ def main() -> int:
             continue
         out_path = _out_path_for(src_path, multi_mode=(len(src_paths) > 1 or args.mode_each))
         out_path.write_text(c_src, encoding="utf-8")
+        print("")
         print(f"Wrote {out_path}")
         row["c_source"] = str(out_path)
         if not has_program_unit:

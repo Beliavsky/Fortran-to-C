@@ -39,6 +39,7 @@ _ACTIVE_PROC_ARG_CTYPES: Dict[str, List[str]] = {}
 _ACTIVE_PROC_ARG_IS_ARRAY: Dict[str, List[bool]] = {}
 _ACTIVE_PROC_ARG_ASSUMED_RANKS: Dict[str, List[int]] = {}
 _ACTIVE_PROC_IS_ELEMENTAL: Dict[str, bool] = {}
+_SHARED_RUNTIME_PROCS = {"count_fields", "split_csv_line"}
 
 
 def _complex_ctype(real_type: str) -> str:
@@ -1105,6 +1106,8 @@ def _normalize_actual_args(
 def _format_item_ctype(expr: str, vars_map: Dict[str, Var], real_type: str) -> str:
     s = _rewrite_type_bound_calls(expr.strip(), vars_map, real_type)
     if _is_fortran_string_literal(s):
+        return 'string'
+    if '//' in s:
         return 'string'
     if re.fullmatch(r"(?i)\.(?:true|false)\.", s):
         return 'logical'
@@ -2678,6 +2681,18 @@ def _rewrite_inline_if_write(text: str) -> tuple[str, List[int]]:
             out.append(f"{indent}if ({cond}) then")
             line_map.append(i)
             out.append(f"{indent}   write {write_tail}")
+            line_map.append(i)
+            out.append(f"{indent}end if")
+            line_map.append(i)
+            continue
+        m = re.match(r"^(\s*)if\s*\((.*)\)\s*print\s+(.+)$", raw, re.IGNORECASE)
+        if m:
+            indent = m.group(1)
+            cond = m.group(2).strip()
+            print_tail = m.group(3).strip()
+            out.append(f"{indent}if ({cond}) then")
+            line_map.append(i)
+            out.append(f"{indent}   print {print_tail}")
             line_map.append(i)
             out.append(f"{indent}end if")
             line_map.append(i)
@@ -7162,7 +7177,8 @@ def _transpile_unit(
         code_arg = arg_text.strip()
         c_stop = "1"
         if code_arg:
-            if (code_arg.startswith('"') and code_arg.endswith('"')) or (code_arg.startswith("'") and code_arg.endswith("'")):
+            arg_ctype = _format_item_ctype(code_arg, vars_map, real_type)
+            if arg_ctype == "string":
                 c_msg = _convert_expr(
                     code_arg,
                     vars_map,
@@ -7489,6 +7505,7 @@ def _transpile_unit(
                 else:
                     unit_c = _convert_expr(unit_txt, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                 file_c = _convert_expr(file_txt, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                file_c = f"trim_s({file_c})"
                 action_c = _convert_expr(action_txt, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                 status_c = _convert_expr(status_txt, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                 if iostat_txt:
@@ -11212,7 +11229,7 @@ def _transpile_unit(
             if m_lhs_whole_arr:
                 lhs_nm_arr = m_lhs_whole_arr.group(1).lower()
                 lv_arr = vars_map.get(lhs_nm_arr)
-                if lv_arr is not None and lv_arr.is_array:
+                if lv_arr is not None and (lv_arr.is_array or bool(_dim_parts(lv_arr.dim))):
                     # Whole-array assignment lowering.
                     rhs_scan = _strip_comment(rhs_raw)
                     rhs_tokens = {t.lower() for t in re.findall(r"\b[a-z_]\w*\b", rhs_scan, flags=re.IGNORECASE)}
@@ -11358,6 +11375,7 @@ def _transpile_unit(
                     if len(lhs_parts_resolved) == 2:
                         rhs_sec_expr = rhs_raw
                         sec_changed = False
+                        rhs_sec_shape: Optional[List[str]] = None
                         for an_sec, av_sec in sorted(vars_map.items(), key=lambda kv: len(kv[0]), reverse=True):
                             if not av_sec.is_array:
                                 continue
@@ -11365,13 +11383,24 @@ def _transpile_unit(
                             pat_sec = re.compile(rf"\b{re.escape(an_sec)}\s*\(\s*([^()]*)\s*\)", re.IGNORECASE)
 
                             def _repl_rhs_rank2(mm: re.Match[str]) -> str:
-                                nonlocal sec_changed
+                                nonlocal sec_changed, rhs_sec_shape
                                 inner = mm.group(1)
                                 idx_parts = _split_args_top_level(inner)
                                 if len(dparts_sec) != 2 or len(idx_parts) != 2:
                                     return mm.group(0)
                                 if (":" not in idx_parts[0]) or (":" not in idx_parts[1]):
                                     return mm.group(0)
+                                if rhs_sec_shape is None:
+                                    sec_shape = _section_shape_exprs(
+                                        mm.group(0),
+                                        vars_map,
+                                        real_type,
+                                        byref_scalars,
+                                        assumed_extents,
+                                        proc_arg_extent_names,
+                                    )
+                                    if sec_shape is not None and len(sec_shape) == 2:
+                                        rhs_sec_shape = sec_shape
                                 d1 = _convert_expr(dparts_sec[0], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                                 d2 = _convert_expr(dparts_sec[1], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                                 sp0 = _split_colon_top_level(idx_parts[0].strip())
@@ -11386,8 +11415,19 @@ def _transpile_unit(
                             rhs_sec_expr = pat_sec.sub(_repl_rhs_rank2, rhs_sec_expr)
                         if sec_changed:
                             rhs = _convert_expr(rhs_sec_expr, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
-                            d1_lhs = _convert_expr(lhs_parts_resolved[0], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
-                            d2_lhs = _convert_expr(lhs_parts_resolved[1], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                            if lv_arr.is_allocatable and rhs_sec_shape is not None and len(rhs_sec_shape) == 2:
+                                d1_lhs = _convert_expr(rhs_sec_shape[0], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                                d2_lhs = _convert_expr(rhs_sec_shape[1], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                                nfill = f"(({d1_lhs}) * ({d2_lhs}))"
+                                out.append(" " * indent + f"if ({lhs_nm_arr}) free({lhs_nm_arr});")
+                                out.append(" " * indent + f"{lhs_nm_arr} = ({lv_arr.ctype}*) malloc(sizeof({lv_arr.ctype}) * ({nfill}));")
+                                out.append(" " * indent + f"if (!{lhs_nm_arr} && ({nfill}) > 0) {fail_stmt}")
+                                ext_names = _alloc_extent_names(lhs_nm_arr, 2)
+                                out.append(" " * indent + f"{ext_names[0]} = {d1_lhs};")
+                                out.append(" " * indent + f"{ext_names[1]} = {d2_lhs};")
+                            else:
+                                d1_lhs = _convert_expr(lhs_parts_resolved[0], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                                d2_lhs = _convert_expr(lhs_parts_resolved[1], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                             out.append(" " * indent + f"for (int i2_fill = 0; i2_fill < {d2_lhs}; ++i2_fill) {{")
                             out.append(" " * (indent + 3) + f"for (int i1_fill = 0; i1_fill < {d1_lhs}; ++i1_fill) {{")
                             out.append(" " * (indent + 6) + f"{lhs_nm_arr}[i1_fill + ({d1_lhs}) * i2_fill] = {rhs};")
@@ -12103,6 +12143,8 @@ def transpile_fortran_to_c(
 
     # Emit forward declarations so calls compile even when definitions appear later.
     for u, vmap in zip(units, decl_maps):
+        if str(u.get("name", "")).lower() in _SHARED_RUNTIME_PROCS:
+            continue
         if u.get("kind") == "function":
             ret_name = (u.get("result") or "").lower()
             ret_lookup = ret_name if ret_name else str(u.get("name", "")).lower()
@@ -12141,6 +12183,8 @@ def transpile_fortran_to_c(
         out.append("")
 
     for u, vmap in zip(units, decl_maps):
+        if str(u.get("name", "")).lower() in _SHARED_RUNTIME_PROCS:
+            continue
         out.extend(
             _transpile_unit(
                 u,

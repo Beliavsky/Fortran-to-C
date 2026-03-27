@@ -55,6 +55,7 @@ Coverage is still incomplete. The project is driven by real examples, so unsuppo
 - [xc_post.py](xc_post.py): conservative C readability cleanup
 - [xnormalize.py](xnormalize.py): output normalization used by `--pretty`
 - [xf2c_batch.py](xf2c_batch.py): cross-platform runner for many Fortran files
+- [xf2c_example_md.py](xf2c_example_md.py): export a Fortran example, generated C, and both outputs to Markdown
 
 ## Basic Usage
 
@@ -205,6 +206,10 @@ Override them if needed:
 ```cmd
 python xf2c_batch.py xhello.f90 --opts "--compile"
 ```
+
+## Example
+
+- [xreturns_stats.md](xreturns_stats.md): example page showing the Fortran source, generated C, and both outputs
 
 ## What Works Well Today
 
