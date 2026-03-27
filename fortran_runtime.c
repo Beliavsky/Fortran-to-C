@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <ctype.h>
 
 static char *tmp_str_buf(size_t need) {
    /* Reuse a small ring of heap buffers for transient string results. */
@@ -290,6 +291,36 @@ int rewind_unit(int unit) {
 }
 
 
+int backspace_unit(int unit) {
+   /* Reposition an open logical unit to the start of the previous text record. */
+   FILE *fp = unit_get(unit);
+   long pos;
+   if (!fp) return 1;
+   pos = ftell(fp);
+   if (pos < 0) return 1;
+   if (pos == 0) return 0;
+   while (pos > 0) {
+      int ch;
+      --pos;
+      if (fseek(fp, pos, SEEK_SET) != 0) return 1;
+      ch = fgetc(fp);
+      if (ch == '\n' || ch == '\r') continue;
+      break;
+   }
+   while (pos > 0) {
+      int ch;
+      --pos;
+      if (fseek(fp, pos, SEEK_SET) != 0) return 1;
+      ch = fgetc(fp);
+      if (ch == '\n' || ch == '\r') {
+         ++pos;
+         break;
+      }
+   }
+   return fseek(fp, pos, SEEK_SET) == 0 ? 0 : 1;
+}
+
+
 int write_bytes_unit(int unit, long pos1, const void *buf, size_t elem_size, int count) {
    /* Write raw stream bytes at the current file position or a 1-based stream POS. */
    FILE *fp = unit_get(unit);
@@ -316,6 +347,26 @@ void write_a(int unit, const char *s) {
 }
 
 
+void write_i0_then_words(int unit, int iv, int n, const char *const *words) {
+   /* Write i0 followed by n space-separated character items and a newline. */
+   FILE *fp = unit_get(unit);
+   if (!fp || (n > 0 && !words)) return;
+   fprintf(fp, "%d", iv);
+   for (int i = 0; i < n; ++i) {
+      fprintf(fp, " %s", words[i] ? words[i] : "");
+   }
+   fputc('\n', fp);
+}
+
+
+int write_int_float_record(int unit, int iw, int fw, int fd, int iv, double rv) {
+   /* Write one formatted INTEGER/REAL text record with explicit field widths. */
+   FILE *fp = unit_get(unit);
+   if (!fp) return 1;
+   return fprintf(fp, "%*d %*.*f\n", iw, iv, fw, fd, rv) < 0 ? 1 : 0;
+}
+
+
 int read_a(int unit, char *buf, int len) {
    /* Read one character record and blank-pad the destination buffer. */
    FILE *fp = unit_get(unit);
@@ -327,6 +378,36 @@ int read_a(int unit, char *buf, int len) {
    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = '\0';
    for (int i = n; i < len; ++i) buf[i] = ' ';
    buf[len] = '\0';
+   return 0;
+}
+
+
+int read_int_float_record(int unit, int *iv, float *rv) {
+   /* Read one whitespace-separated INTEGER/REAL text record. */
+   char buf[256];
+   int itmp;
+   float rtmp;
+   FILE *fp = unit_get(unit);
+   if (!fp || !iv || !rv) return 1;
+   if (!fgets(buf, (int) sizeof(buf), fp)) return 1;
+   if (sscanf(buf, "%d%f", &itmp, &rtmp) != 2) return 1;
+   *iv = itmp;
+   *rv = rtmp;
+   return 0;
+}
+
+
+int read_int_double_record(int unit, int *iv, double *rv) {
+   /* Read one whitespace-separated INTEGER/DOUBLE text record. */
+   char buf[256];
+   int itmp;
+   double rtmp;
+   FILE *fp = unit_get(unit);
+   if (!fp || !iv || !rv) return 1;
+   if (!fgets(buf, (int) sizeof(buf), fp)) return 1;
+   if (sscanf(buf, "%d%lf", &itmp, &rtmp) != 2) return 1;
+   *iv = itmp;
+   *rv = rtmp;
    return 0;
 }
 
@@ -355,6 +436,19 @@ int read_int_s(const char *s, int *out) {
 }
 
 
+int read_first_int_s(const char *s, int *out) {
+   /* Parse the leading INTEGER item from an internal list-directed record. */
+   char *end = NULL;
+   long v;
+   const char *src = skip_space_s(s);
+   if (!src || !out || *src == '\0') return 1;
+   v = strtol(src, &end, 10);
+   if (end == src) return 1;
+   *out = (int) v;
+   return 0;
+}
+
+
 int read_float_s(const char *s, float *out) {
    /* Parse a scalar REAL from an internal character buffer. */
    char *end = NULL;
@@ -365,6 +459,19 @@ int read_float_s(const char *s, float *out) {
    if (end == src) return 1;
    end = (char *) skip_space_s(end);
    if (*end != '\0') return 1;
+   *out = v;
+   return 0;
+}
+
+
+int read_first_float_s(const char *s, float *out) {
+   /* Parse the leading REAL item from an internal list-directed record. */
+   char *end = NULL;
+   float v;
+   const char *src = skip_space_s(s);
+   if (!src || !out || *src == '\0') return 1;
+   v = strtof(src, &end);
+   if (end == src) return 1;
    *out = v;
    return 0;
 }
@@ -382,6 +489,48 @@ int read_double_s(const char *s, double *out) {
    if (*end != '\0') return 1;
    *out = v;
    return 0;
+}
+
+
+int read_first_double_s(const char *s, double *out) {
+   /* Parse the leading DOUBLE PRECISION item from an internal list-directed record. */
+   char *end = NULL;
+   double v;
+   const char *src = skip_space_s(s);
+   if (!src || !out || *src == '\0') return 1;
+   v = strtod(src, &end);
+   if (end == src) return 1;
+   *out = v;
+   return 0;
+}
+
+
+int read_words_after_int_s(const char *s, int nw, char **words) {
+   /* Parse an initial count followed by nw whitespace-delimited words. */
+   char *end = NULL;
+   long v;
+   const char *src = skip_space_s(s);
+   if (!src || nw < 0 || (nw > 0 && !words) || *src == '\0') return 1;
+   v = strtol(src, &end, 10);
+   if (end == src || (int) v != nw) return 1;
+   src = end;
+   for (int i = 0; i < nw; ++i) {
+      const char *start = NULL;
+      size_t len = 0;
+      src = skip_space_s(src);
+      if (!src || *src == '\0') return 1;
+      start = src;
+      while (*src != '\0' && !isspace((unsigned char) *src)) ++src;
+      len = (size_t) (src - start);
+      if (len == 0) return 1;
+      if (words[i]) free(words[i]);
+      words[i] = (char *) malloc(len + 1);
+      if (!words[i]) return 1;
+      memcpy(words[i], start, len);
+      words[i][len] = '\0';
+   }
+   src = skip_space_s(src);
+   return (src && *src == '\0') ? 0 : 1;
 }
 
 

@@ -343,7 +343,7 @@ def find_implicit_none_undeclared_identifiers(
 
     keywords = {
         "do", "end", "if", "then", "else", "call", "print", "write", "read",
-        "open", "close", "rewind", "result", "function", "subroutine", "program", "module", "contains",
+        "open", "close", "rewind", "backspace", "result", "function", "subroutine", "program", "module", "contains",
         "use", "only", "implicit", "none", "intent", "in", "out", "inout", "return",
         "real", "integer", "logical", "character", "complex", "type", "class",
         "kind", "len", "parameter", "optional", "double", "precision", "select", "case", "default", "procedure",
@@ -829,6 +829,10 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
             if not unit_stack:
                 in_implicit_main = True
             continue
+        if re.match(r"^backspace\s*\(.*\)\s*$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
         if re.match(r"^read\s*\(.*\)\s+.+$", low):
             if not unit_stack:
                 in_implicit_main = True
@@ -869,6 +873,10 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
             if not unit_stack:
                 in_implicit_main = True
             continue
+        if re.match(r"^if\s*\(.+\)\s*write\s*\(.*\)\s*(?:,\s*.+|\s+.+)?$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
         if re.match(r"^if\s*\(.+\)\s*[a-z_]\w*(?:\s*\([^)]*\))?(?:\s*%\s*[a-z_]\w*(?:\s*\([^)]*\))?)*\s*=\s*.+$", low):
             if not unit_stack:
                 in_implicit_main = True
@@ -894,6 +902,18 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
                 in_implicit_main = True
             continue
         if re.match(r'^print\s*\*\s*$', low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
+        if re.match(r"^forall\s*\(.*\)\s*$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
+        if re.match(r"^forall\s*\(.*\)\s*.+$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
+        if re.match(r"^end\s+forall\s*$", low):
             if not unit_stack:
                 in_implicit_main = True
             continue
