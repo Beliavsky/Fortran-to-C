@@ -21,7 +21,10 @@ USE_RE = re.compile(
     re.IGNORECASE,
 )
 MODULE_DEF_RE = re.compile(r"^\s*module\s+([a-z][a-z0-9_]*)\b", re.IGNORECASE)
-INTERFACE_START_RE = re.compile(r"^\s*(abstract\s+)?interface\b(?:\s+([a-z][a-z0-9_]*))?", re.IGNORECASE)
+INTERFACE_START_RE = re.compile(
+    r"^\s*(abstract\s+)?interface\b(?:\s+((?:operator\s*\([^)]*\)|assignment\s*\([^)]*\)|[a-z][a-z0-9_]*)))?",
+    re.IGNORECASE,
+)
 END_INTERFACE_RE = re.compile(r"^\s*end\s+interface\b", re.IGNORECASE)
 MODULE_PROCEDURE_RE = re.compile(r"^\s*module\s+procedure\b(.+)$", re.IGNORECASE)
 CALL_RE = re.compile(r"\bcall\s+([a-z][a-z0-9_]*)\b", re.IGNORECASE)
@@ -340,20 +343,27 @@ def find_implicit_none_undeclared_identifiers(
 
     keywords = {
         "do", "end", "if", "then", "else", "call", "print", "write", "read",
-        "open", "close", "result", "function", "subroutine", "program", "module", "contains",
+        "open", "close", "rewind", "result", "function", "subroutine", "program", "module", "contains",
         "use", "only", "implicit", "none", "intent", "in", "out", "inout", "return",
         "real", "integer", "logical", "character", "complex", "type", "class",
-        "kind", "len", "parameter", "optional", "double", "precision", "select", "case", "default",
-        "save", "external", "dimension", "allocatable", "exit", "stop", "and", "or", "not",
+        "kind", "len", "parameter", "optional", "double", "precision", "select", "case", "default", "procedure",
+        "save", "external", "dimension", "allocatable", "pointer", "target", "exit", "cycle", "stop", "error", "and", "or", "not", "eqv", "neqv",
         "true", "false",
     }
     intrinsics = {
         "sqrt", "real", "int", "dble", "nint", "anint", "aint", "floor", "ceiling", "log10", "sign", "mod", "modulo",
-        "sum", "size", "shape", "lbound", "ubound", "allocated", "max", "min", "sin", "cos", "tan",
-        "abs", "exp", "log", "random_number", "random_seed", "present", "product", "epsilon",
+        "sum", "size", "shape", "lbound", "ubound", "allocated", "max", "min", "minval", "maxval", "matmul", "transpose", "huge",
+        "sin", "cos", "acos", "asin", "atan", "tan",
+        "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+        "abs", "exp", "log", "gamma", "log_gamma", "random_number", "random_seed", "present", "product", "epsilon",
         "reshape", "spread", "pack", "count", "any", "all", "dot_product", "index", "len_trim", "norm2",
-        "merge", "rank", "trim",
-        "int8", "int16", "int32", "int64", "real32", "real64", "real128",
+        "minloc", "maxloc", "findloc",
+        "merge", "rank", "trim", "adjustl", "adjustr", "repeat", "scan", "verify", "achar", "char", "iachar", "new_line",
+        "cmplx", "conjg", "aimag",
+        "selected_real_kind", "selected_int_kind", "digits", "tiny", "maxexponent", "minexponent", "precision", "radix", "range", "bit_size",
+        "nearest", "spacing", "exponent", "fraction", "set_exponent", "scale", "storage_size",
+        "cosd", "sind", "tand", "acosd", "asind", "bessel_j0", "bessel_j1", "bessel_y0", "bessel_y1",
+        "int8", "int16", "int32", "int64", "real32", "real64", "real128", "null",
     }
 
     declish_re = re.compile(
@@ -539,6 +549,15 @@ def find_implicit_none_undeclared_identifiers(
                 continue
             if low in {"implicit none", "contains"} or low.startswith("use "):
                 continue
+            if re.match(r"^[a-z_]\w*\s*:\s*do(?:\s+[a-z_]\w*\s*=.*)?\s*$", low):
+                code = re.sub(r"^[a-z_]\w*\s*:\s*", "", code, count=1, flags=re.IGNORECASE)
+                low = code.lower()
+            if re.match(r"^end\s+do(?:\s+[a-z_]\w*)?\s*$", low):
+                continue
+            if re.match(r"^(?:exit|cycle)(?:\s+[a-z_]\w*)?\s*$", low):
+                continue
+            if re.match(r"^if\s*\(.+\)\s*(?:exit|cycle)(?:\s+[a-z_]\w*)?\s*$", low):
+                continue
             if low.startswith("allocate(") or low.startswith("allocate ("):
                 continue
             if low.startswith("deallocate(") or low.startswith("deallocate ("):
@@ -547,7 +566,7 @@ def find_implicit_none_undeclared_identifiers(
                 continue
             line_no = line_nos[idx] if idx < len(line_nos) else -1
 
-            m_do = re.match(r"^do\s+([a-z_]\w*)\s*=", code, re.IGNORECASE)
+            m_do = re.match(r"^(?:[a-z_]\w*\s*:\s*)?do\s+([a-z_]\w*)\s*=", code, re.IGNORECASE)
             if m_do:
                 v = m_do.group(1).lower()
                 if v not in known_decl:
@@ -597,6 +616,7 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
     lines = text.splitlines()
     unit_stack: List[Tuple[str, str, int]] = []  # (kind, name, start_line)
     in_implicit_main = False
+    interface_depth = 0
 
     def _balanced_parens(s: str) -> bool:
         depth = 0
@@ -638,8 +658,19 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
             else:
                 errs.append(f"line {lineno}: unexpected end")
             continue
+        if INTERFACE_START_RE.match(low):
+            interface_depth += 1
+            continue
+        if END_INTERFACE_RE.match(low):
+            if interface_depth > 0:
+                interface_depth -= 1
+            else:
+                errs.append(f"line {lineno}: unexpected end interface")
+            continue
+        if interface_depth > 0:
+            continue
         m_mod = re.match(r"^module\s+([a-z_]\w*)\b", low)
-        if m_mod:
+        if m_mod and not low.startswith("module procedure"):
             unit_stack.append(("module", m_mod.group(1).lower(), lineno))
             continue
         m_end_mod = re.match(r"^end\s+module(?:\s+([a-z_]\w*))?\b", low)
@@ -734,23 +765,27 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
             if not unit_stack:
                 in_implicit_main = True
             continue
+        if re.match(r"^procedure(?:\s*\([^)]*\))?(?:\s*,\s*[^:]*)*\s*::\s*[a-z_]\w*(?:\s*(?:=>)?\s*[a-z_]\w*)?(?:\s*,\s*[a-z_]\w*(?:\s*(?:=>)?\s*[a-z_]\w*)?)*\s*$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
         if re.match(r"^end\s+type(?:\s+[a-z_]\w*)?\s*$", low):
             if not unit_stack:
                 in_implicit_main = True
             continue
-        if re.match(r"^do\s+[a-z_]\w*\s*=\s*.+$", low):
+        if re.match(r"^(?:[a-z_]\w*\s*:\s*)?do\s+[a-z_]\w*\s*=\s*.+$", low):
             if not unit_stack:
                 in_implicit_main = True
             continue
-        if low == "do":
+        if re.match(r"^(?:[a-z_]\w*\s*:\s*)?do\s*$", low):
             if not unit_stack:
                 in_implicit_main = True
             continue
-        if low == "end do":
+        if re.match(r"^end\s+do(?:\s+[a-z_]\w*)?\s*$", low):
             if not unit_stack:
                 in_implicit_main = True
             continue
-        if low == "exit":
+        if re.match(r"^(?:exit|cycle)(?:\s+[a-z_]\w*)?\s*$", low):
             if not unit_stack:
                 in_implicit_main = True
             continue
@@ -762,11 +797,19 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
             if not unit_stack:
                 in_implicit_main = True
             continue
+        if re.match(r"^error\s+stop(?:\s*\(\s*[^)]*\s*\)|\s+.+)?\s*$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
         if re.match(r"^call\s+random_number(?:\s*\(.*\))?\s*$", low):
             if not unit_stack:
                 in_implicit_main = True
             continue
-        if re.match(r"^allocate\s*\(\s*[a-z_]\w*(?:\s*\([^)]*\))?(?:\s*%\s*[a-z_]\w*(?:\s*\([^)]*\))?)*(?:\s*,\s*(?:source|mold)\s*=\s*.+)?\s*\)\s*$", low):
+        if re.match(r"^call\s+[a-z_]\w*(?:\s*%\s*[a-z_]\w+)+\s*\(.*\)\s*$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
+        if re.match(r"^allocate\s*\(\s*.+\s*\)\s*$", low):
             if not unit_stack:
                 in_implicit_main = True
             continue
@@ -782,6 +825,10 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
             if not unit_stack:
                 in_implicit_main = True
             continue
+        if re.match(r"^rewind\s*\(.*\)\s*$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
         if re.match(r"^read\s*\(.*\)\s+.+$", low):
             if not unit_stack:
                 in_implicit_main = True
@@ -791,6 +838,10 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
                 in_implicit_main = True
             continue
         if re.match(r"^if\s*\(.+\)\s*return\s*$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
+        if re.match(r"^if\s*\(.+\)\s*(?:exit|cycle)(?:\s+[a-z_]\w*)?\s*$", low):
             if not unit_stack:
                 in_implicit_main = True
             continue
@@ -811,6 +862,10 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
                 in_implicit_main = True
             continue
         if re.match(r"^if\s*\(.+\)\s*call\s+[a-z_]\w*(?:\s*\(.*\))?\s*$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
+        if re.match(r"^if\s*\(.+\)\s*error\s+stop(?:\s*\(\s*[^)]*\s*\)|\s+.+)?\s*$", low):
             if not unit_stack:
                 in_implicit_main = True
             continue
@@ -835,6 +890,10 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
                 in_implicit_main = True
             continue
         if re.match(r"^(?:public|private)(?:\s*::\s*.*)?$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
+        if re.match(r'^print\s*\*\s*$', low):
             if not unit_stack:
                 in_implicit_main = True
             continue
@@ -1932,7 +1991,11 @@ def _expr_is_declared_integer(expr: str, int_names: Set[str]) -> bool:
     if re.search(r"[^a-z0-9_+\-*/()\s]", s, re.IGNORECASE):
         return False
 
-    integer_intrinsics = {"int", "nint", "floor", "ceiling", "size", "lbound", "ubound", "len", "kind", "rank", "count", "index", "len_trim"}
+    integer_intrinsics = {
+        "int", "nint", "floor", "ceiling", "size", "lbound", "ubound", "len", "kind", "rank", "count", "index",
+        "len_trim", "scan", "verify", "iachar", "minloc", "maxloc", "findloc", "selected_real_kind", "selected_int_kind",
+        "digits", "maxexponent", "minexponent", "precision", "radix", "range", "bit_size", "exponent", "storage_size",
+    }
 
     # Reject likely function calls except known integer-valued intrinsics.
     for m in re.finditer(r"\b([a-z_]\w*)\s*\(", s, re.IGNORECASE):
@@ -1942,7 +2005,7 @@ def _expr_is_declared_integer(expr: str, int_names: Set[str]) -> bool:
 
     # Replace known integer-valued intrinsic calls with a scalar placeholder.
     # This avoids falsely treating their argument identifiers as standalone vars.
-    intr_pat = re.compile(r"\b(?:size|lbound|ubound|len|kind|rank|int|nint|floor|ceiling|count|index|len_trim)\s*\([^()]*\)", re.IGNORECASE)
+    intr_pat = re.compile(r"\b(?:size|lbound|ubound|len|kind|rank|int|nint|floor|ceiling|count|index|len_trim|minloc|maxloc|findloc|selected_real_kind|selected_int_kind|digits|maxexponent|minexponent|precision|radix|range|bit_size|exponent|storage_size)\s*\([^()]*\)", re.IGNORECASE)
     prev = None
     while prev != s:
         prev = s
@@ -2500,7 +2563,7 @@ def _expr_is_real_like(expr: str, real_names: Set[str]) -> bool:
             return True
     # Common real-valued intrinsic calls / constructors.
     if re.search(
-        r"\b(?:real|sqrt|log|exp|sin|cos|tan|asin|acos|atan|minval|maxval|sum|mean|dot_product)\s*\(",
+        r"\b(?:real|sqrt|log|exp|sin|cos|tan|asin|acos|atan|sinh|cosh|tanh|asinh|acosh|atanh|gamma|log_gamma|cosd|sind|tand|acosd|asind|bessel_j0|bessel_j1|bessel_y0|bessel_y1|minval|maxval|sum|mean|dot_product)\s*\(",
         s,
         re.IGNORECASE,
     ):
@@ -5483,6 +5546,16 @@ def _rhs_has_disallowed_calls(rhs: str, declared: Set[str]) -> bool:
         "index",
         "mod",
         "merge",
+        "adjustl",
+        "adjustr",
+        "repeat",
+        "trim",
+        "scan",
+        "verify",
+        "achar",
+        "char",
+        "iachar",
+        "storage_size",
     }
     for m in re.finditer(r"([a-z][a-z0-9_]*)\s*\(", rhs, re.IGNORECASE):
         name = m.group(1).lower()
@@ -6046,13 +6119,15 @@ def rewrite_named_arguments_in_statement(
     m_call_head = re.match(r"^\s*call\s+([a-z][a-z0-9_]*)\s*\(", code, re.IGNORECASE)
     call_head_name = m_call_head.group(1).lower() if m_call_head else None
     intrinsic_ignore = {
-        "abs", "acos", "aimag", "aint", "all", "anint", "any", "asin", "atan", "atan2",
-        "ceiling", "cmplx", "conjg", "cos", "cosh", "count", "cpu_time", "dble", "digits",
+        "abs", "acos", "acosd", "acosh", "aimag", "aint", "all", "anint", "any", "asin", "asind", "asinh", "atan", "atan2", "atanh",
+        "bessel_j0", "bessel_j1", "bessel_y0", "bessel_y1",
+        "ceiling", "cmplx", "conjg", "cos", "cosd", "cosh", "count", "cpu_time", "dble", "digits",
         "dot_product", "epsilon", "exp", "floor", "huge", "iachar", "ichar", "index", "int",
-        "kind", "len", "log", "log10", "matmul", "max", "maxval", "merge", "min", "minval",
-        "mod", "nint", "pack", "present", "product", "real", "reshape", "scan", "selected_int_kind",
-        "selected_real_kind", "shape", "sign", "sin", "sinh", "size", "spacing", "spread", "sqrt",
-        "sum", "tan", "tanh", "tiny", "trim", "ubound", "lbound",
+        "kind", "len", "log", "log10", "log_gamma", "matmul", "max", "maxval", "merge", "min", "minval",
+        "mod", "nint", "pack", "present", "product", "real", "reshape", "scan", "verify", "adjustl", "adjustr", "repeat", "achar", "char", "iachar", "selected_int_kind",
+        "selected_real_kind", "shape", "sign", "sin", "sind", "sinh", "size", "spacing", "spread", "sqrt", "storage_size",
+        "sum", "tan", "tand", "tanh", "tiny", "trim", "ubound", "lbound", "minloc", "maxloc", "findloc", "gamma",
+        "maxexponent", "minexponent", "precision", "radix", "range", "bit_size", "nearest", "exponent", "fraction", "set_exponent", "scale",
     }
     segments = _find_call_like_segments(code)
     if not segments:

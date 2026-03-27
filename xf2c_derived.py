@@ -18,7 +18,7 @@ def _local_derived_type_index_ranges(unit: Dict[str, object]) -> List[tuple[int,
         if not code:
             continue
         if not in_type:
-            m_type = re.match(r"^type\s+([a-z_]\w*)\s*$", code, re.IGNORECASE)
+            m_type = re.match(r"^type\s*(?:::)?\s*([a-z_]\w*)\s*$", code, re.IGNORECASE)
             if m_type:
                 in_type = True
                 start_idx = idx
@@ -116,7 +116,7 @@ def _parse_local_derived_types(
         if not code:
             continue
         if current is None:
-            m_type = re.match(r"^type\s+([a-z_]\w*)\s*$", code, re.IGNORECASE)
+            m_type = re.match(r"^type\s*(?:::)?\s*([a-z_]\w*)\s*$", code, re.IGNORECASE)
             if m_type:
                 current = m_type.group(1).lower()
                 fields = []
