@@ -11,6 +11,7 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 PROC_START_RE = re.compile(
     r"^\s*(?P<prefix>(?:(?:pure|elemental|impure|recursive|module)\s+)*)"
+    r"(?:(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|double\s+precision)\s+)?"
     r"(?P<kind>function|subroutine)\s+"
     r"(?P<name>[a-z][a-z0-9_]*)\s*(?P<arglist>\([^)]*\))?",
     re.IGNORECASE,
@@ -203,7 +204,7 @@ def split_fortran_units_simple(text: str) -> List[Dict[str, object]]:
     stmts = iter_fortran_statements(lines)
 
     proc_hdr_re = re.compile(
-        r"^(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:(?:integer|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|double\s+precision)\s+)?(function|subroutine)\s+([a-z_]\w*)\s*(\([^)]*\))?(?:\s*result\s*\(\s*([a-z_]\w*)\s*\))?\s*$",
+        r"^(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|double\s+precision)\s+)?(function|subroutine)\s+([a-z_]\w*)\s*(\([^)]*\))?(?:\s*result\s*\(\s*([a-z_]\w*)\s*\))?\s*$",
         re.IGNORECASE,
     )
     prog_hdr_re = re.compile(r"^program\s+([a-z_]\w*)\s*$", re.IGNORECASE)
@@ -348,6 +349,7 @@ def find_implicit_none_undeclared_identifiers(
         "real", "integer", "logical", "character", "complex", "type", "class",
         "kind", "len", "parameter", "optional", "double", "precision", "select", "case", "default", "procedure",
         "save", "external", "dimension", "allocatable", "pointer", "target", "exit", "cycle", "stop", "error", "and", "or", "not", "eqv", "neqv",
+        "intrinsic", "public", "private", "generic",
         "true", "false",
     }
     intrinsics = {
@@ -360,6 +362,7 @@ def find_implicit_none_undeclared_identifiers(
         "minloc", "maxloc", "findloc",
         "merge", "rank", "trim", "adjustl", "adjustr", "repeat", "scan", "verify", "achar", "char", "iachar", "new_line",
         "cmplx", "conjg", "aimag",
+        "iand", "ior", "ieor", "ishft",
         "selected_real_kind", "selected_int_kind", "digits", "tiny", "maxexponent", "minexponent", "precision", "radix", "range", "bit_size",
         "nearest", "spacing", "exponent", "fraction", "set_exponent", "scale", "storage_size",
         "cosd", "sind", "tand", "acosd", "asind", "bessel_j0", "bessel_j1", "bessel_y0", "bessel_y1",
@@ -514,6 +517,8 @@ def find_implicit_none_undeclared_identifiers(
             else:
                 declared.add(str(u.get("name", "")).lower())
         known_decl = declared | imported | host_declared
+        active_associate_names: Set[str] = set()
+        associate_name_stack: List[Set[str]] = []
 
         # Validate declaration-spec identifiers (e.g. kind=dp, x(n)).
         for idx, stmt in enumerate(body):
@@ -547,7 +552,22 @@ def find_implicit_none_undeclared_identifiers(
             low = code.lower()
             if not code:
                 continue
-            if low in {"implicit none", "contains"} or low.startswith("use "):
+            m_assoc = re.match(r"^associate\s*\((.*)\)\s*$", code, re.IGNORECASE)
+            if m_assoc:
+                names_here: Set[str] = set()
+                for ent in _split_top_level_commas(m_assoc.group(1).strip()):
+                    m_bind = re.match(r"^\s*([a-z_]\w*)\s*=>", ent, re.IGNORECASE)
+                    if m_bind:
+                        names_here.add(m_bind.group(1).lower())
+                associate_name_stack.append(names_here)
+                active_associate_names |= names_here
+                continue
+            if re.match(r"^end\s+associate\b", low):
+                if associate_name_stack:
+                    for nm in associate_name_stack.pop():
+                        active_associate_names.discard(nm)
+                continue
+            if low in {"implicit none", "contains"} or re.match(r"^use\b", low):
                 continue
             if re.match(r"^[a-z_]\w*\s*:\s*do(?:\s+[a-z_]\w*\s*=.*)?\s*$", low):
                 code = re.sub(r"^[a-z_]\w*\s*:\s*", "", code, count=1, flags=re.IGNORECASE)
@@ -576,7 +596,7 @@ def find_implicit_none_undeclared_identifiers(
             m_asn = re.match(r"^([a-z_]\w*)(?:\s*%\s*[a-z_]\w*)*\b(?:\s*\([^)]*\))?\s*=\s*(.+)$", code, re.IGNORECASE)
             if m_asn:
                 lhs = m_asn.group(1).lower()
-                if lhs not in known_decl and lhs not in keywords:
+                if lhs not in known_decl and lhs not in active_associate_names and lhs not in keywords:
                     errs.append(
                         f"{u['kind']} {u['name']}:{line_no} undeclared variable '{lhs}' on assignment LHS with implicit none"
                     )
@@ -597,7 +617,7 @@ def find_implicit_none_undeclared_identifiers(
                 t = tok.lower()
                 if call_callee and t == call_callee:
                     continue
-                if t in known_decl or t in keywords or t in intrinsics or t in known:
+                if t in known_decl or t in active_associate_names or t in keywords or t in intrinsics or t in known:
                     continue
                 if t in kw_arg_names:
                     continue
@@ -704,12 +724,12 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
                 errs.append(f"line {lineno}: unexpected end program")
             continue
         m_fun = re.match(
-            r"^(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:(?:integer|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|double\s+precision)\s+)?function\s+[a-z_]\w*\s*\([^)]*\)\s*(?:result\s*\(\s*[a-z_]\w*\s*\))?\s*$",
+            r"^(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|double\s+precision)\s+)?function\s+[a-z_]\w*\s*\([^)]*\)\s*(?:result\s*\(\s*[a-z_]\w*\s*\))?\s*$",
             low,
         )
         if m_fun:
             m_name = re.match(
-                r"^(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:(?:integer|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|double\s+precision)\s+)?function\s+([a-z_]\w*)\b",
+                r"^(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|double\s+precision)\s+)?function\s+([a-z_]\w*)\b",
                 low,
             )
             if m_name:
@@ -766,6 +786,10 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
                 in_implicit_main = True
             continue
         if re.match(r"^procedure(?:\s*\([^)]*\))?(?:\s*,\s*[^:]*)*\s*::\s*[a-z_]\w*(?:\s*(?:=>)?\s*[a-z_]\w*)?(?:\s*,\s*[a-z_]\w*(?:\s*(?:=>)?\s*[a-z_]\w*)?)*\s*$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
+        if re.match(r"^generic(?:\s*,\s*[^:]*)*\s*::\s*(?:operator\s*\([^)]*\)|assignment\s*\([^)]*\)|write\s*\(\s*formatted\s*\)|[a-z_]\w*)\s*=>\s*.+$", low):
             if not unit_stack:
                 in_implicit_main = True
             continue
@@ -869,6 +893,10 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
             if not unit_stack:
                 in_implicit_main = True
             continue
+        if re.match(r"^if\s*\(.+\)\s*call\s+[a-z_]\w*(?:\s*%\s*[a-z_]\w+)+\s*\(.*\)\s*$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
         if re.match(r"^if\s*\(.+\)\s*error\s+stop(?:\s*\(\s*[^)]*\s*\)|\s+.+)?\s*$", low):
             if not unit_stack:
                 in_implicit_main = True
@@ -914,6 +942,14 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
                 in_implicit_main = True
             continue
         if re.match(r"^end\s+forall\s*$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
+        if re.match(r"^associate\s*\(.*\)\s*$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
+        if re.match(r"^end\s+associate\s*$", low):
             if not unit_stack:
                 in_implicit_main = True
             continue

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import shlex
 import subprocess
 import sys
@@ -53,7 +54,17 @@ def _parse_args() -> argparse.Namespace:
 
 def _load_sources(args: argparse.Namespace) -> list[str]:
     if args.files:
-        return args.files
+        sources: list[str] = []
+        for pattern in args.files:
+            if glob.has_magic(pattern):
+                matches = sorted(glob.glob(pattern))
+                if matches:
+                    sources.extend(matches)
+                else:
+                    sources.append(pattern)
+            else:
+                sources.append(pattern)
+        return sources
 
     file_list = Path(args.file_list)
     if not file_list.is_file():

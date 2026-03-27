@@ -578,6 +578,7 @@ void fill_rand_1d_double(int n, double *x) {
 
 static uint64_t mt_state[312] = {0};
 static int mt_index = 313;
+static void mt_seed_default(void);
 
 void rng_seed(int64_t seed) {
    /* Seed the shared MT19937-64 generator with one integer seed. */
@@ -587,6 +588,54 @@ void rng_seed(int64_t seed) {
                            (mt_state[mt_index - 1] ^ (mt_state[mt_index - 1] >> 62)) +
                            (uint64_t) mt_index;
    }
+}
+
+
+void rng_seed_vector(int n, const int64_t *seed) {
+   /* Seed the shared MT19937-64 generator from an integer seed vector. */
+   static const uint64_t c1 = UINT64_C(3935559000370003845);
+   static const uint64_t c2 = UINT64_C(2862933555777941757);
+   int i;
+   int j;
+   int k;
+   int kk;
+
+   if (!seed || n <= 0) {
+      mt_seed_default();
+      return;
+   }
+
+   rng_seed((int64_t) 19650218);
+   i = 1;
+   j = 0;
+   k = (312 > n) ? 312 : n;
+
+   for (kk = 0; kk < k; ++kk) {
+      mt_state[i] = (mt_state[i] ^
+                     (c1 * (mt_state[i - 1] ^ (mt_state[i - 1] >> 62)))) +
+                    (uint64_t) seed[j] + (uint64_t) j;
+      ++i;
+      ++j;
+      if (i >= 312) {
+         mt_state[0] = mt_state[311];
+         i = 1;
+      }
+      if (j >= n) j = 0;
+   }
+
+   for (kk = 0; kk < 311; ++kk) {
+      mt_state[i] = (mt_state[i] ^
+                     (c2 * (mt_state[i - 1] ^ (mt_state[i - 1] >> 62)))) -
+                    (uint64_t) i;
+      ++i;
+      if (i >= 312) {
+         mt_state[0] = mt_state[311];
+         i = 1;
+      }
+   }
+
+   mt_state[0] = UINT64_C(1) << 63;
+   mt_index = 312;
 }
 
 
@@ -634,6 +683,19 @@ static uint64_t mt_genrand64_int64(void) {
 double runif(void) {
    /* Return one reproducible uniform variate in [0, 1). */
    return (double) (mt_genrand64_int64() >> 11) * (1.0 / 9007199254740992.0);
+}
+
+
+double *runif_1d(int n) {
+   /* Allocate and return a 1D DOUBLE PRECISION array of reproducible MT19937-64 uniforms. */
+   double *x;
+   int i;
+
+   if (n <= 0) return NULL;
+   x = (double *) malloc(sizeof(double) * (size_t) n);
+   if (!x) return NULL;
+   for (i = 0; i < n; ++i) x[i] = runif();
+   return x;
 }
 
 

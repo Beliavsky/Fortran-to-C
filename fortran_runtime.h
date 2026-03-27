@@ -46,7 +46,9 @@ void split_csv_line(const char *line, int n, char **fields); /* Split a trimmed 
 void fill_rand_1d_float(int n, float *x); /* Fill a 1D REAL array with uniform pseudo-random values in [0, 1]. */
 void fill_rand_1d_double(int n, double *x); /* Fill a 1D DOUBLE PRECISION array with uniform pseudo-random values in [0, 1]. */
 void rng_seed(int64_t seed); /* Seed the shared MT19937-64 generator with one integer seed. */
+void rng_seed_vector(int n, const int64_t *seed); /* Seed the shared MT19937-64 generator from an integer seed vector. */
 double runif(void); /* Return one reproducible uniform variate in [0, 1). */
+double *runif_1d(int n); /* Allocate and return a 1D DOUBLE PRECISION array of reproducible MT19937-64 uniforms. */
 void fill_runif_1d(int n, double *x); /* Fill a 1D DOUBLE PRECISION array with reproducible MT19937-64 uniforms. */
 void fill_runif_2d(int n1, int n2, double *x); /* Fill a 2D DOUBLE PRECISION array with reproducible MT19937-64 uniforms. */
 

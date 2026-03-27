@@ -8,6 +8,25 @@ from typing import Dict, List, Optional, Tuple
 
 from xf2c_textutil import _split_args_top_level, _strip_comment
 
+def _replace_param_names(expr: str, param_exprs: Optional[Dict[str, str]]) -> str:
+    if not param_exprs:
+        return expr
+    out = expr
+    changed = True
+    while changed:
+        changed = False
+        for nm, rhs in sorted(param_exprs.items(), key=lambda kv: len(kv[0]), reverse=True):
+            new_out = re.sub(rf"(?i)\b{re.escape(nm)}\b", f"({rhs})", out)
+            if new_out != out:
+                out = new_out
+                changed = True
+    out = re.sub(
+        r"(?i)\b(([0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[ed][+\-]?[0-9]+)?)_(?:[a-z_]\w*|\d+)\b",
+        r"\1",
+        out,
+    )
+    return out
+
 
 def _local_derived_type_index_ranges(unit: Dict[str, object]) -> List[tuple[int, int]]:
     ranges: List[tuple[int, int]] = []
@@ -18,7 +37,7 @@ def _local_derived_type_index_ranges(unit: Dict[str, object]) -> List[tuple[int,
         if not code:
             continue
         if not in_type:
-            m_type = re.match(r"^type\s*(?:::)?\s*([a-z_]\w*)\s*$", code, re.IGNORECASE)
+            m_type = re.match(r"^type(?:\s*,\s*[^:]*)?\s*(?:::)?\s*([a-z_]\w*)\s*$", code, re.IGNORECASE)
             if m_type:
                 in_type = True
                 start_idx = idx
@@ -41,16 +60,31 @@ def _parse_derived_field_decl(
     code: str,
     real_type: str,
     kind_ctype_map: Optional[Dict[str, str]] = None,
+    param_exprs: Optional[Dict[str, str]] = None,
 ) -> List[tuple[str, str]]:
     out: List[tuple[str, str]] = []
     base: Optional[str] = None
     rhs: Optional[str] = None
     attrs = ""
-    m = re.match(r"^integer(?:\s*\([^)]*\))?(?:\s*,\s*([^:]+))?\s*::\s*(.+)$", code, re.IGNORECASE)
+    m = re.match(r"^integer\s*\(\s*(?:kind\s*=\s*)?([a-z_]\w*|\d+)\s*\)(?:\s*,\s*([^:]+))?\s*::\s*(.+)$", code, re.IGNORECASE)
     if m:
-        base, attrs, rhs = 'int', (m.group(1) or ''), m.group(2)
+        kind_tok = m.group(1).lower()
+        base = kind_ctype_map.get(kind_tok, 'long long' if (kind_tok.isdigit() and int(kind_tok) >= 8) else 'int') if kind_ctype_map else ('long long' if (kind_tok.isdigit() and int(kind_tok) >= 8) else 'int')
+        base, attrs, rhs = base, (m.group(2) or ''), m.group(3)
+    if base is None:
+        m = re.match(r"^integer(?:\s*\([^)]*\))?(?:\s*,\s*([^:]+))?\s*::\s*(.+)$", code, re.IGNORECASE)
+        if m:
+            base, attrs, rhs = 'int', (m.group(1) or ''), m.group(2)
     if base is None:
         m = re.match(r"^real\s*\(\s*kind\s*=\s*([a-z_]\w*|\d+)\s*\)(?:\s*,\s*([^:]+))?\s*::\s*(.+)$", code, re.IGNORECASE)
+        if m:
+            kind_tok = m.group(1).lower()
+            base = kind_ctype_map.get(kind_tok, real_type) if kind_ctype_map else real_type
+            if kind_tok.isdigit():
+                base = 'double' if int(kind_tok) >= 8 else 'float'
+            attrs, rhs = (m.group(2) or ''), m.group(3)
+    if base is None:
+        m = re.match(r"^real\s*\(\s*([a-z_]\w*|\d+)\s*\)(?:\s*,\s*([^:]+))?\s*::\s*(.+)$", code, re.IGNORECASE)
         if m:
             kind_tok = m.group(1).lower()
             base = kind_ctype_map.get(kind_tok, real_type) if kind_ctype_map else real_type
@@ -92,7 +126,7 @@ def _parse_derived_field_decl(
         m_arr = re.match(r"^([a-z_]\w*)\s*\(\s*(.+)\s*\)$", ent0, re.IGNORECASE)
         if m_arr:
             name = m_arr.group(1)
-            dim = m_arr.group(2).strip()
+            dim = _replace_param_names(m_arr.group(2).strip(), param_exprs)
         nm = name.lower()
         if is_alloc and dim:
             out.append((nm, f"{base} allocatable[{dim}]"))
@@ -107,6 +141,7 @@ def _parse_local_derived_types(
     unit: Dict[str, object],
     real_type: str,
     kind_ctype_map: Optional[Dict[str, str]] = None,
+    param_exprs: Optional[Dict[str, str]] = None,
 ) -> Dict[str, List[tuple[str, str]]]:
     out: Dict[str, List[tuple[str, str]]] = {}
     current: Optional[str] = None
@@ -116,7 +151,7 @@ def _parse_local_derived_types(
         if not code:
             continue
         if current is None:
-            m_type = re.match(r"^type\s*(?:::)?\s*([a-z_]\w*)\s*$", code, re.IGNORECASE)
+            m_type = re.match(r"^type(?:\s*,\s*[^:]*)?\s*(?:::)?\s*([a-z_]\w*)\s*$", code, re.IGNORECASE)
             if m_type:
                 current = m_type.group(1).lower()
                 fields = []
@@ -126,7 +161,7 @@ def _parse_local_derived_types(
             current = None
             fields = []
             continue
-        fields.extend(_parse_derived_field_decl(code, real_type, kind_ctype_map))
+        fields.extend(_parse_derived_field_decl(code, real_type, kind_ctype_map, param_exprs))
     return out
 
 
