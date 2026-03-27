@@ -173,44 +173,6 @@ If you want one standalone generated C file:
 python xf2c.py xread.f90 --single-file
 ```
 
-## Running Many Examples
-
-The batch runner reads example names from [fortran_files.txt](fortran_files.txt):
-
-```cmd
-xf2c.bat
-```
-
-Override the file list on the command line:
-
-```cmd
-xf2c.bat xhello.f90 xlogical.f90
-```
-
-Limit how many files are processed:
-
-```cmd
-xf2c.bat --limit 5
-```
-
-## Testing
-
-Run the Python test suite:
-
-```cmd
-python -m pytest tests/test_xf2c_cli.py tests/test_xc_post.py tests/test_mt19937_runif.py -q
-```
-
-The pytest harness can also select the C compiler:
-
-```cmd
-python -m pytest tests/test_xf2c_cli.py tests/test_xc_post.py tests/test_mt19937_runif.py -q --c-compiler=gcc
-python -m pytest tests/test_xf2c_cli.py tests/test_xc_post.py tests/test_mt19937_runif.py -q --c-compiler=clang
-python -m pytest tests/test_xf2c_cli.py tests/test_xc_post.py tests/test_mt19937_runif.py -q --c-compiler=msvc
-```
-
-The most meaningful tests use `--run-both` and compare normalized Fortran and C output, not just whether the generated C compiles.
-
 ## What Works Well Today
 
 The project is strongest on:
@@ -256,7 +218,7 @@ python xf2c.py your_file.f90 --run-both
 python xf2c.py your_file.f90 --tee
 ```
 
-4. Add a focused pytest regression once the feature works.
+4. Keep a small regression example and rerun it after each extension.
 
 ## Project Direction
 
