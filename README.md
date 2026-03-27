@@ -1,6 +1,6 @@
 # Fortran-to-C
 
-`xf2c.py` is a small source-to-source transpiler that converts a substantial subset of free-form Fortran into readable C.
+`xf2c.py` is a Python source-to-source transpiler, developed with Codex, that converts a substantial subset of free-form Fortran into readable C.
 
 It is intended for:
 
@@ -46,14 +46,14 @@ Coverage is still incomplete. The project is driven by real examples, so unsuppo
 
 ## Main Files
 
-- [xf2c.py](/c:/python/fortran/f2c/xf2c.py): thin CLI entry point
-- [xf2c_driver.py](/c:/python/fortran/f2c/xf2c_driver.py): CLI, build, run, and orchestration
-- [xf2c_core.py](/c:/python/fortran/f2c/xf2c_core.py): main transpilation logic
-- [fortran_scan.py](/c:/python/fortran/f2c/fortran_scan.py): scanning and validation
-- [fortran_runtime.c](/c:/python/fortran/f2c/fortran_runtime.c): shared C runtime helpers
-- [fortran_runtime.h](/c:/python/fortran/f2c/fortran_runtime.h): shared runtime declarations
-- [xc_post.py](/c:/python/fortran/f2c/xc_post.py): conservative C readability cleanup
-- [xnormalize.py](/c:/python/fortran/f2c/xnormalize.py): output normalization used by `--pretty`
+- [xf2c.py](xf2c.py): thin CLI entry point
+- [xf2c_driver.py](xf2c_driver.py): CLI, build, run, and orchestration
+- [xf2c_core.py](xf2c_core.py): main transpilation logic
+- [fortran_scan.py](fortran_scan.py): scanning and validation
+- [fortran_runtime.c](fortran_runtime.c): shared C runtime helpers
+- [fortran_runtime.h](fortran_runtime.h): shared runtime declarations
+- [xc_post.py](xc_post.py): conservative C readability cleanup
+- [xnormalize.py](xnormalize.py): output normalization used by `--pretty`
 
 ## Basic Usage
 
@@ -162,8 +162,8 @@ python xf2c.py xsum_dim.f90 --raw --tee
 
 By default, generated programs include and link the shared runtime:
 
-- [fortran_runtime.h](/c:/python/fortran/f2c/fortran_runtime.h)
-- [fortran_runtime.c](/c:/python/fortran/f2c/fortran_runtime.c)
+- [fortran_runtime.h](fortran_runtime.h)
+- [fortran_runtime.c](fortran_runtime.c)
 
 This keeps emitted C shorter and more readable.
 
@@ -175,7 +175,7 @@ python xf2c.py xread.f90 --single-file
 
 ## Running Many Examples
 
-The batch runner reads example names from [fortran_files.txt](/c:/python/fortran/f2c/fortran_files.txt):
+The batch runner reads example names from [fortran_files.txt](fortran_files.txt):
 
 ```cmd
 xf2c.bat
