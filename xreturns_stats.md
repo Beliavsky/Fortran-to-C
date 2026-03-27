@@ -1,5 +1,5 @@
 # xreturns_stats
-`c:\Programs\Python313\python.exe xf2c.py xreturns_stats.f90 --run-both`
+`python xf2c.py xreturns_stats.f90 --run-both`
 
 ## Fortran
 

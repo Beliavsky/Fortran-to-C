@@ -61,12 +61,16 @@ def main() -> int:
         return 1
 
     cmd = [sys.executable, str(xf2c_path), str(src_path), "--run-both"]
+    display_cmd = ["python", xf2c_path.name, src_path.name, "--run-both"]
     if args.pretty:
         cmd.append("--pretty")
+        display_cmd.append("--pretty")
     if args.annotate:
         cmd.append("--annotate")
+        display_cmd.append("--annotate")
     if args.raw:
         cmd.append("--raw")
+        display_cmd.append("--raw")
 
     proc = subprocess.run(
         cmd,
@@ -93,7 +97,7 @@ def main() -> int:
     out_path = Path(args.out) if args.out else src_path.with_suffix(".md")
     md = []
     md.append(f"# {src_path.stem}\n")
-    md.append(f"`{' '.join(cmd)}`\n")
+    md.append(f"`{' '.join(display_cmd)}`\n")
     md.append("\n## Fortran\n\n")
     md.append(_markdown_block("fortran", f_src))
     md.append("\n## Fortran Output\n\n")
