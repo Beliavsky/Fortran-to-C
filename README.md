@@ -209,7 +209,7 @@ python xf2c_batch.py xhello.f90 --opts "--compile"
 
 ## Example
 
-- [xreturns_stats.md](xreturns_stats.md): example page showing the Fortran source, generated C, and both outputs
+- [xreturns_stats.md](xreturns_stats.md): example page showing the Fortran source, generated C, and both outputs for a program that reads stock prices and computes returns statistics and correlations
 
 ## What Works Well Today
 
