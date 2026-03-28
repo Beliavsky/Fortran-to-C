@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import re
 import shlex
 import subprocess
 import sys
@@ -49,6 +50,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print each Fortran source file before running xf2c.py.",
     )
+    parser.add_argument(
+        "--quiet-runs",
+        action="store_true",
+        help="Hide successful Fortran/C program stdout while still running them.",
+    )
     return parser.parse_args()
 
 
@@ -75,6 +81,28 @@ def _load_sources(args: argparse.Namespace) -> list[str]:
         for line in file_list.read_text(encoding="utf-8", errors="replace").splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
+
+
+def _suppress_successful_run_output(text: str) -> str:
+    kept: list[str] = []
+    suppress = False
+    top_level = re.compile(
+        r"^(?:Build \([^)]+\):|Run \([^)]+\):|Wrote\s+\S+|--summary:|\[PASS\]|\[FAIL\]|=+|TOTAL=|FAILED \.f90 FILES:)"
+    )
+    run_pass = re.compile(r"^Run \([^)]+\): PASS$")
+    for line in text.splitlines():
+        if run_pass.match(line):
+            kept.append(line)
+            suppress = True
+            continue
+        if suppress:
+            if top_level.match(line):
+                suppress = False
+                kept.append(line)
+            continue
+        kept.append(line)
+    tail = "\n" if text.endswith("\n") else ""
+    return "\n".join(kept) + tail
 
 
 def main() -> int:
@@ -122,7 +150,24 @@ def main() -> int:
             print()
 
         cmd = [args.python_cmd, str(xf2c_path), src_name, *xf2c_opts]
-        proc = subprocess.run(cmd, check=False)
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=args.quiet_runs,
+            text=args.quiet_runs,
+        )
+        if args.quiet_runs:
+            if proc.returncode == 0:
+                filtered = _suppress_successful_run_output(proc.stdout)
+                if filtered:
+                    print(filtered, end="" if filtered.endswith("\n") else "\n")
+                if proc.stderr:
+                    print(proc.stderr, end="" if proc.stderr.endswith("\n") else "\n", file=sys.stderr)
+            else:
+                if proc.stdout:
+                    print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n")
+                if proc.stderr:
+                    print(proc.stderr, end="" if proc.stderr.endswith("\n") else "\n", file=sys.stderr)
         if proc.returncode == 0:
             print(f"[PASS] {src_name}")
             passed += 1

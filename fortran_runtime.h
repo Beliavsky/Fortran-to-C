@@ -66,6 +66,11 @@ int maxval_1d_int(int n, const int *x); /* Return the largest element of a 1D IN
 int count_1d_int(int n, const int *x); /* Count nonzero elements of a 1D LOGICAL/INTEGER mask array. */
 int any_1d_int(int n, const int *x); /* Return whether any element of a 1D LOGICAL/INTEGER mask is true. */
 int all_1d_int(int n, const int *x); /* Return whether every element of a 1D LOGICAL/INTEGER mask is true. */
+int any_eq_1d_int(int n, int u, const int *v); /* Return whether any 1D INTEGER/LOGICAL element equals a scalar. */
+int any_eq_1d_float(int n, float u, const float *v); /* Return whether any 1D REAL element equals a scalar. */
+int any_eq_1d_double(int n, double u, const double *v); /* Return whether any 1D DOUBLE PRECISION element equals a scalar. */
+int any_eq_1d_string(int n, const char *u, char *const *v); /* Return whether any 1D CHARACTER element equals a scalar, ignoring trailing blanks. */
+int any_eq_1d_charbuf(int n, int elem_len, const char *u, const char *v); /* Return whether any fixed-length CHARACTER buffer element equals a scalar, ignoring trailing blanks. */
 float dot_product_1d_float(int n, const float *x, const float *y); /* Compute the dot product of two 1D REAL arrays. */
 double dot_product_1d_double(int n, const double *x, const double *y); /* Compute the dot product of two 1D DOUBLE PRECISION arrays. */
 int dot_product_1d_int(int n, const int *x, const int *y); /* Compute the dot product of two 1D INTEGER arrays. */

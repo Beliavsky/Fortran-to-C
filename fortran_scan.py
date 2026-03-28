@@ -196,7 +196,8 @@ def split_fortran_units_simple(text: str) -> List[Dict[str, object]]:
     """Split free-form Fortran into top-level and internal program units.
 
     Returns dicts with keys: kind, name, args, result, body_lines,
-    body_line_nos, header_line_no, body_start_line_no, source_lines.
+    body_line_nos, header_line_no, body_start_line_no, contains_line_no,
+    end_line_no, source_lines.
     Internal procedures are returned as separate units before their parent unit,
     and are excluded from the parent's executable body.
     """
@@ -239,6 +240,8 @@ def split_fortran_units_simple(text: str) -> List[Dict[str, object]]:
         body_line_nos: List[int] = []
         nested_units: List[Dict[str, object]] = []
         in_contains = False
+        contains_lineno = None
+        end_lineno = hdr_lineno
         while j < len(stmts):
             lineno_j, stmt_j = stmts[j]
             c = stmt_j.strip()
@@ -246,9 +249,11 @@ def split_fortran_units_simple(text: str) -> List[Dict[str, object]]:
             if not in_contains:
                 if low_j == 'contains':
                     in_contains = True
+                    contains_lineno = lineno_j
                     j += 1
                     continue
                 if end_re.match(low_j) or low_j == 'end':
+                    end_lineno = lineno_j
                     break
                 if stmt_j:
                     body.append(stmt_j)
@@ -257,6 +262,7 @@ def split_fortran_units_simple(text: str) -> List[Dict[str, object]]:
                 continue
 
             if end_re.match(low_j) or low_j == 'end':
+                end_lineno = lineno_j
                 break
             if prog_hdr_re.match(low_j) or _parse_proc_header(low_j):
                 inner, next_j = _parse_unit(j)
@@ -274,6 +280,8 @@ def split_fortran_units_simple(text: str) -> List[Dict[str, object]]:
             'body_line_nos': body_line_nos,
             'header_line_no': hdr_lineno,
             'body_start_line_no': body_line_nos[0] if body_line_nos else (hdr_lineno + 1),
+            'contains_line_no': contains_lineno,
+            'end_line_no': end_lineno,
             'source_lines': lines,
         }
         return nested_units + [unit], j + 1
@@ -321,6 +329,8 @@ def split_fortran_units_simple(text: str) -> List[Dict[str, object]]:
                 'body_line_nos': body_line_nos,
                 'header_line_no': body_line_nos[0] if body_line_nos else 1,
                 'body_start_line_no': body_line_nos[0] if body_line_nos else 1,
+                'contains_line_no': None,
+                'end_line_no': body_line_nos[-1] if body_line_nos else 1,
                 'source_lines': lines,
             })
     return out
@@ -350,7 +360,7 @@ def find_implicit_none_undeclared_identifiers(
         "kind", "len", "parameter", "optional", "double", "precision", "select", "case", "default", "procedure",
         "save", "external", "dimension", "allocatable", "pointer", "target", "exit", "cycle", "stop", "error", "and", "or", "not", "eqv", "neqv",
         "intrinsic", "public", "private", "generic",
-        "true", "false",
+        "true", "false", "while",
     }
     intrinsics = {
         "sqrt", "real", "int", "dble", "nint", "anint", "aint", "floor", "ceiling", "log10", "sign", "mod", "modulo",
@@ -396,11 +406,39 @@ def find_implicit_none_undeclared_identifiers(
         return out_n
 
     def _host_declared_before_unit(u: Dict[str, object]) -> Set[str]:
-        """Collect names declared in containing module spec-part before CONTAINS."""
+        """Collect names host-associated from enclosing units/modules."""
         src = list(u.get("source_lines", []))
         hline = int(u.get("header_line_no", 0))
         if not src or hline <= 0:
             return set()
+        out_n: Set[str] = set()
+
+        # Nearest enclosing program/subroutine/function with a CONTAINS before this unit.
+        host_unit = None
+        for cand in units:
+            cand_header = int(cand.get("header_line_no", 0))
+            cand_end = int(cand.get("end_line_no", 0))
+            cand_contains = cand.get("contains_line_no")
+            if cand is u:
+                continue
+            if cand_header < hline <= cand_end and cand_contains and int(cand_contains) < hline:
+                if host_unit is None or cand_header > int(host_unit.get("header_line_no", 0)):
+                    host_unit = cand
+        if host_unit is not None:
+            out_n.update(a.lower() for a in host_unit.get("args", []))
+            host_result = str(host_unit.get("result") or "").strip().lower()
+            if host_result:
+                out_n.add(host_result)
+            elif str(host_unit.get("kind", "")).lower() == "function":
+                out_n.add(str(host_unit.get("name", "")).lower())
+            for stmt in host_unit.get("body_lines", []):
+                c = strip_comment(str(stmt)).strip()
+                if not c:
+                    continue
+                if declish_re.match(c):
+                    out_n.update(parse_declared_names_from_decl(c))
+                out_n.update(_names_from_use_only(c))
+
         # nearest enclosing module start before unit
         mod_start = None
         for i in range(hline - 2, -1, -1):
@@ -409,7 +447,7 @@ def find_implicit_none_undeclared_identifiers(
                 mod_start = i
                 break
         if mod_start is None:
-            return set()
+            return out_n
         # module contains location before unit header
         contains_i = None
         for i in range(mod_start + 1, hline - 1):
@@ -418,8 +456,7 @@ def find_implicit_none_undeclared_identifiers(
                 contains_i = i
                 break
         if contains_i is None:
-            return set()
-        out_n: Set[str] = set()
+            return out_n
         for i in range(mod_start + 1, contains_i):
             c = strip_comment(src[i]).strip()
             if not c:
@@ -573,6 +610,8 @@ def find_implicit_none_undeclared_identifiers(
                 code = re.sub(r"^[a-z_]\w*\s*:\s*", "", code, count=1, flags=re.IGNORECASE)
                 low = code.lower()
             if re.match(r"^end\s+do(?:\s+[a-z_]\w*)?\s*$", low):
+                continue
+            if re.match(r"^(?:[a-z_]\w*\s*:\s*)?do\s+while\s*\(.+\)\s*$", low):
                 continue
             if re.match(r"^(?:exit|cycle)(?:\s+[a-z_]\w*)?\s*$", low):
                 continue
@@ -905,7 +944,15 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
             if not unit_stack:
                 in_implicit_main = True
             continue
+        if re.match(r"^if\s*\(\s*allocated\s*\(\s*[a-z_]\w*\s*\)\s*\)\s*deallocate\s*\(\s*[a-z_]\w*(?:\s*,\s*[a-z_]\w*)*\s*\)\s*$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
         if re.match(r"^if\s*\(.+\)\s*[a-z_]\w*(?:\s*\([^)]*\))?(?:\s*%\s*[a-z_]\w*(?:\s*\([^)]*\))?)*\s*=\s*.+$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
+        if re.match(r"^(?:[a-z_]\w*\s*:\s*)?do\s+while\s*\(.+\)\s*$", low):
             if not unit_stack:
                 in_implicit_main = True
             continue

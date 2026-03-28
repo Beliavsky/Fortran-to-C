@@ -696,6 +696,86 @@ def _simplify_condition_code(code: str) -> str:
     while out.count(")") > out.count("(") and out.endswith(")"):
         out = out[:-1].rstrip()
     out = re.sub(r"(?<![A-Za-z0-9_])\(\s*([A-Za-z_]\w*|[+\-]?\d+)\s*\)", r"\1", out)
+    def _split_top_level_comparison(text: str) -> Optional[tuple[str, str, str]]:
+        depth_paren = 0
+        depth_brack = 0
+        depth_brace = 0
+        in_single = False
+        in_double = False
+        esc = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if esc:
+                esc = False
+                i += 1
+                continue
+            if ch == "\\" and (in_single or in_double):
+                esc = True
+                i += 1
+                continue
+            if ch == "'" and not in_double:
+                in_single = not in_single
+                i += 1
+                continue
+            if ch == '"' and not in_single:
+                in_double = not in_double
+                i += 1
+                continue
+            if in_single or in_double:
+                i += 1
+                continue
+            if ch == "(":
+                depth_paren += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth_paren = max(0, depth_paren - 1)
+                i += 1
+                continue
+            if ch == "[":
+                depth_brack += 1
+                i += 1
+                continue
+            if ch == "]":
+                depth_brack = max(0, depth_brack - 1)
+                i += 1
+                continue
+            if ch == "{":
+                depth_brace += 1
+                i += 1
+                continue
+            if ch == "}":
+                depth_brace = max(0, depth_brace - 1)
+                i += 1
+                continue
+            if depth_paren or depth_brack or depth_brace:
+                i += 1
+                continue
+            two = text[i : i + 2]
+            if two in {"<=", ">=", "==", "!="}:
+                return text[:i], two, text[i + 2 :]
+            if ch in "<>":
+                return text[:i], ch, text[i + 1 :]
+            i += 1
+        return None
+
+    def _safe_simplify_condition_operand(text: str) -> str:
+        raw = text.strip()
+        if not raw:
+            return raw
+        if re.search(r"\b[A-Za-z_]\w*\s*\(", raw):
+            return raw
+        return simplify_expr_text(raw)
+
+    cmp_parts = _split_top_level_comparison(out)
+    if cmp_parts is not None:
+        lhs, op, rhs = cmp_parts
+        lhs_new = _safe_simplify_condition_operand(lhs)
+        rhs_new = _safe_simplify_condition_operand(rhs)
+        out = f"{lhs_new} {op} {rhs_new}"
+    elif not re.search(r"[&|!?=<>]", out):
+        out = _safe_simplify_condition_operand(out)
     return out
 
 
@@ -1079,6 +1159,43 @@ def _rewrite_local_buffer_length_enums(lines: list[str]) -> list[str]:
     return out
 
 
+def _merge_immediate_simple_initializers(lines: list[str]) -> list[str]:
+    decl_re = re.compile(
+        r"^(?P<indent>\s*)(?P<type>(?:const\s+)?(?:unsigned\s+|signed\s+)?(?:short\s+|long\s+)?"
+        r"(?:int|float|double|char)\s*(?:\*+\s*)?)(?P<name>[A-Za-z_]\w*)\s*;\s*$"
+    )
+    assign_re = re.compile(r"^(?P<indent>\s*)(?P<name>[A-Za-z_]\w*)\s*=\s*(?P<rhs>.+?)\s*;\s*$")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        if i + 1 >= len(lines):
+            out.append(lines[i])
+            break
+        line = lines[i]
+        next_line = lines[i + 1]
+        code, comment = _split_cpp_comment(line.rstrip("\r\n"))
+        next_code, next_comment = _split_cpp_comment(next_line.rstrip("\r\n"))
+        m_decl = decl_re.match(code)
+        m_assign = assign_re.match(next_code)
+        if (
+            m_decl
+            and m_assign
+            and not comment
+            and not next_comment
+            and m_decl.group("name") == m_assign.group("name")
+            and m_decl.group("indent") == m_assign.group("indent")
+        ):
+            eol = "\n" if line.endswith("\n") or next_line.endswith("\n") else ""
+            out.append(
+                f"{m_decl.group('indent')}{m_decl.group('type')}{m_decl.group('name')} = {m_assign.group('rhs')};{eol}"
+            )
+            i += 2
+            continue
+        out.append(line)
+        i += 1
+    return out
+
+
 def _is_supported_ast(node: ast.AST) -> bool:
     if isinstance(node, ast.Expression):
         return _is_supported_ast(node.body)
@@ -1147,6 +1264,62 @@ def _contains_call(expr: Expr) -> bool:
     return False
 
 
+def _flatten_add_terms(expr: Expr) -> Optional[list[tuple[int, Expr]]]:
+    if expr.kind == "bin" and expr.value == "+":
+        left_terms = _flatten_add_terms(expr.left)
+        right_terms = _flatten_add_terms(expr.right)
+        if left_terms is None or right_terms is None:
+            return None
+        return left_terms + right_terms
+    if expr.kind == "bin" and expr.value == "-":
+        left_terms = _flatten_add_terms(expr.left)
+        right_terms = _flatten_add_terms(expr.right)
+        if left_terms is None or right_terms is None:
+            return None
+        return left_terms + [(-sign, term) for sign, term in right_terms]
+    if expr.kind == "unary" and expr.value == "-":
+        terms = _flatten_add_terms(expr.operand)
+        if terms is None:
+            return None
+        return [(-sign, term) for sign, term in terms]
+    if expr.kind == "unary" and expr.value == "+":
+        return _flatten_add_terms(expr.operand)
+    if expr.kind in {"const", "name", "subscript", "attr", "call"}:
+        return [(1, expr)]
+    return None
+
+
+def _combine_add_terms(terms: list[tuple[int, Expr]]) -> Optional[Expr]:
+    const_sum = 0
+    rebuilt: list[tuple[int, Expr]] = []
+    for sign, term in terms:
+        simp_term = _simplify(term)
+        if _is_int_const(simp_term):
+            const_sum += sign * _const_int(simp_term)
+            continue
+        rebuilt.append((sign, simp_term))
+    if not rebuilt:
+        return Expr("const", value=const_sum)
+    expr: Optional[Expr] = None
+    first_sign, first_term = rebuilt[0]
+    if first_sign == 1:
+        expr = first_term
+    else:
+        expr = Expr("unary", value="-", operand=first_term)
+    for sign, term in rebuilt[1:]:
+        if sign == 1:
+            expr = Expr("bin", value="+", left=expr, right=term)
+        else:
+            expr = Expr("bin", value="-", left=expr, right=term)
+    if const_sum != 0:
+        const_expr = Expr("const", value=abs(const_sum))
+        if const_sum > 0:
+            expr = Expr("bin", value="+", left=expr, right=const_expr)
+        else:
+            expr = Expr("bin", value="-", left=expr, right=const_expr)
+    return expr
+
+
 def _simplify(expr: Expr) -> Expr:
     if expr.kind == "bin":
         left = _simplify(expr.left)
@@ -1171,6 +1344,8 @@ def _simplify(expr: Expr) -> Expr:
                 return left
             if _is_int_const(left) and _const_int(left) == 0:
                 return _simplify(Expr("unary", value="-", operand=right))
+            if _is_int_const(right) and _const_int(right) < 0:
+                return _simplify(Expr("bin", value="+", left=left, right=Expr("const", value=-_const_int(right))))
         if op == "*":
             if _is_int_const(left) and _const_int(left) == 1:
                 return right
@@ -1180,7 +1355,14 @@ def _simplify(expr: Expr) -> Expr:
                 return Expr("const", value=0)
             if _is_int_const(right) and _const_int(right) == 0 and not _contains_call(left):
                 return Expr("const", value=0)
-        return Expr("bin", value=op, left=left, right=right)
+        expr_bin = Expr("bin", value=op, left=left, right=right)
+        if op in {"+", "-"} and not _contains_call(expr_bin):
+            flat_terms = _flatten_add_terms(expr_bin)
+            if flat_terms is not None:
+                combined = _combine_add_terms(flat_terms)
+                if combined is not None:
+                    return combined
+        return expr_bin
     if expr.kind == "unary":
         operand = _simplify(expr.operand)
         op = str(expr.value)
@@ -1338,6 +1520,81 @@ def _rewrite_bracket_exprs(code: str) -> str:
     return "".join(out)
 
 
+def _rewrite_paren_exprs(code: str) -> str:
+    out: list[str] = []
+    in_single = False
+    in_double = False
+    esc = False
+    i = 0
+    while i < len(code):
+        ch = code[i]
+        if esc:
+            out.append(ch)
+            esc = False
+            i += 1
+            continue
+        if ch == "\\" and (in_single or in_double):
+            out.append(ch)
+            esc = True
+            i += 1
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            out.append(ch)
+            i += 1
+            continue
+        if not in_single and not in_double and ch == "(":
+            depth = 1
+            j = i + 1
+            inner_single = False
+            inner_double = False
+            inner_esc = False
+            while j < len(code):
+                cj = code[j]
+                if inner_esc:
+                    inner_esc = False
+                    j += 1
+                    continue
+                if cj == "\\" and (inner_single or inner_double):
+                    inner_esc = True
+                    j += 1
+                    continue
+                if cj == "'" and not inner_double:
+                    inner_single = not inner_single
+                    j += 1
+                    continue
+                if cj == '"' and not inner_single:
+                    inner_double = not inner_double
+                    j += 1
+                    continue
+                if not inner_single and not inner_double:
+                    if cj == "(":
+                        depth += 1
+                    elif cj == ")":
+                        depth -= 1
+                        if depth == 0:
+                            inner = code[i + 1 : j]
+                            inner = _rewrite_paren_exprs(inner)
+                            out.append("(")
+                            out.append(simplify_expr_text(inner))
+                            out.append(")")
+                            i = j + 1
+                            break
+                j += 1
+            else:
+                out.append(ch)
+                i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _find_top_level_assignment(code: str) -> Optional[int]:
     depth_paren = 0
     depth_brack = 0
@@ -1416,6 +1673,7 @@ def postprocess_c_line(line: str, rename_map: Optional[dict[str, str]] = None) -
     code = _rewrite_wrapped_literal_ternaries(code)
     code = _rewrite_atomic_scalar_parens(code)
     code = _rewrite_bracket_exprs(code)
+    code = _rewrite_paren_exprs(code)
     code = _rewrite_assignment_rhs(code)
     return f"{code}{comment}{eol}"
 
@@ -1437,7 +1695,9 @@ def postprocess_c_text(text: str) -> str:
         cond_lines = _rewrite_constant_condition_lines(while_lines)
         final_lines = _remove_unused_loop_label_lines(
             _rewrite_local_buffer_length_enums(
-                _merge_simple_decl_blocks(_remove_unused_const_int_decl_lines(cond_lines))
+                _merge_immediate_simple_initializers(
+                    _merge_simple_decl_blocks(_remove_unused_const_int_decl_lines(cond_lines))
+                )
             )
         )
         new_out = "".join(postprocess_c_line(line, {}) for line in final_lines)

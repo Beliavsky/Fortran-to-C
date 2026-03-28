@@ -831,6 +831,51 @@ int all_1d_int(int n, const int *x) {
 }
 
 
+int any_eq_1d_int(int n, int u, const int *v) {
+   /* Return whether any 1D INTEGER/LOGICAL element equals a scalar. */
+   for (int i = 0; i < n; ++i) if (u == v[i]) return 1;
+   return 0;
+}
+
+
+int any_eq_1d_float(int n, float u, const float *v) {
+   /* Return whether any 1D REAL element equals a scalar. */
+   for (int i = 0; i < n; ++i) if (u == v[i]) return 1;
+   return 0;
+}
+
+
+int any_eq_1d_double(int n, double u, const double *v) {
+   /* Return whether any 1D DOUBLE PRECISION element equals a scalar. */
+   for (int i = 0; i < n; ++i) if (u == v[i]) return 1;
+   return 0;
+}
+
+
+int any_eq_1d_string(int n, const char *u, char *const *v) {
+   /* Return whether any 1D CHARACTER element equals a scalar, ignoring trailing blanks. */
+   int nu = len_trim_s(u);
+   for (int i = 0; i < n; ++i) {
+      int nv = len_trim_s(v[i]);
+      if (nu == nv && strncmp(u, v[i], (size_t) nu) == 0) return 1;
+   }
+   return 0;
+}
+
+
+int any_eq_1d_charbuf(int n, int elem_len, const char *u, const char *v) {
+   /* Return whether any fixed-length CHARACTER buffer element equals a scalar, ignoring trailing blanks. */
+   int nu = len_trim_s(u);
+   int stride = elem_len + 1;
+   for (int i = 0; i < n; ++i) {
+      const char *vi = v + i * stride;
+      int nv = len_trim_s(vi);
+      if (nu == nv && strncmp(u, vi, (size_t) nu) == 0) return 1;
+   }
+   return 0;
+}
+
+
 float dot_product_1d_float(int n, const float *x, const float *y) {
    /* Compute the dot product of two 1D REAL arrays. */
    float s = 0.0f;
