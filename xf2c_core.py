@@ -3575,43 +3575,55 @@ def _rewrite_inline_if_write(text: str) -> tuple[str, List[int]]:
     lines = text.splitlines()
     out: List[str] = []
     line_map: List[int] = []
+
+    def _find_matching_paren_local(s: str, open_idx: int) -> int:
+        depth = 0
+        in_single = False
+        in_double = False
+        i = open_idx
+        while i < len(s):
+            ch = s[i]
+            if ch == "'" and not in_double:
+                if in_single and i + 1 < len(s) and s[i + 1] == "'":
+                    i += 2
+                    continue
+                in_single = not in_single
+                i += 1
+                continue
+            if ch == '"' and not in_single:
+                in_double = not in_double
+                i += 1
+                continue
+            if in_single or in_double:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
+
     for i, raw in enumerate(lines, start=1):
-        m = re.match(r"^(\s*)if\s*\((.*)\)\s*write\s*(\(.+\)\s*.*)$", raw, re.IGNORECASE)
-        if m:
-            indent = m.group(1)
-            cond = m.group(2).strip()
-            write_tail = m.group(3).strip()
-            out.append(f"{indent}if ({cond}) then")
-            line_map.append(i)
-            out.append(f"{indent}   write {write_tail}")
-            line_map.append(i)
-            out.append(f"{indent}end if")
-            line_map.append(i)
-            continue
-        m = re.match(r"^(\s*)if\s*\((.*)\)\s*print\s+(.+)$", raw, re.IGNORECASE)
-        if m:
-            indent = m.group(1)
-            cond = m.group(2).strip()
-            print_tail = m.group(3).strip()
-            out.append(f"{indent}if ({cond}) then")
-            line_map.append(i)
-            out.append(f"{indent}   print {print_tail}")
-            line_map.append(i)
-            out.append(f"{indent}end if")
-            line_map.append(i)
-            continue
-        m = re.match(r"^(\s*)if\s*\((.*)\)\s*deallocate\s*(\(.+\)\s*)$", raw, re.IGNORECASE)
-        if m:
-            indent = m.group(1)
-            cond = m.group(2).strip()
-            dealloc_tail = m.group(3).strip()
-            out.append(f"{indent}if ({cond}) then")
-            line_map.append(i)
-            out.append(f"{indent}   deallocate {dealloc_tail}")
-            line_map.append(i)
-            out.append(f"{indent}end if")
-            line_map.append(i)
-            continue
+        m_head = re.match(r"^(\s*)if\s*\(", raw, re.IGNORECASE)
+        if m_head:
+            indent = m_head.group(1)
+            open_idx = raw.find("(", len(indent))
+            close_idx = _find_matching_paren_local(raw, open_idx)
+            if close_idx > open_idx:
+                cond = raw[open_idx + 1 : close_idx].strip()
+                tail = raw[close_idx + 1 :].strip()
+                low_tail = tail.lower()
+                if tail and low_tail != "then" and not low_tail.startswith("then ") and not low_tail.startswith("then!"):
+                    out.append(f"{indent}if ({cond}) then")
+                    line_map.append(i)
+                    out.append(f"{indent}   {tail}")
+                    line_map.append(i)
+                    out.append(f"{indent}end if")
+                    line_map.append(i)
+                    continue
         out.append(raw)
         line_map.append(i)
     return "\n".join(out) + ("\n" if text.endswith("\n") else ""), line_map
@@ -9794,7 +9806,7 @@ def _transpile_unit(
                 src_cty = _format_item_ctype(unit_txt, vars_map, real_type)
                 tv = vars_map.get(tgt_raw.lower())
                 if (
-                    src_cty != "char *"
+                    src_cty not in {"char *", "string", "trim_string"}
                     and tv is not None
                     and tv.is_array
                     and (tv.ctype or "").lower() == "char *"
@@ -9811,7 +9823,7 @@ def _transpile_unit(
                         out.append(" " * indent + f"if (read_words_unit({src_c}, {n_words}, {tgt_c}) != 0) {fail_stmt}")
                     continue
                 helper = None
-                if src_cty == "char *":
+                if src_cty in {"char *", "string", "trim_string"}:
                     if tgt_cty == "int":
                         helper = "read_first_int_s"
                     elif tgt_cty == "float":
