@@ -6,8 +6,12 @@ from __future__ import annotations
 import argparse
 import glob
 import importlib.util
+import json
+import os
 import re
 import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -17,10 +21,17 @@ from xc_post import postprocess_c_text
 from xf2c_core import transpile_fortran_to_c
 
 REPO_ROOT = Path(__file__).resolve().parent
+PARENT_ROOT = REPO_ROOT.parent
 RUNTIME_C_PATH = REPO_ROOT / "fortran_runtime.c"
 XNORMALIZE_CANDIDATES = [
     REPO_ROOT / "xnormalize.py",
     Path(r"c:\python\code\xnormalize.py"),
+]
+XFREE_CANDIDATES = [
+    PARENT_ROOT / "xfree.py",
+]
+XCOMMON_CANDIDATES = [
+    PARENT_ROOT / "xcommon.py",
 ]
 INTRINSIC_MODULES = {
     "iso_fortran_env",
@@ -47,6 +58,109 @@ def _load_normalize_text():
 
 
 _NORMALIZE_TEXT = _load_normalize_text()
+
+
+def _load_xfree_convert_text():
+    if str(PARENT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PARENT_ROOT))
+    for path in XFREE_CANDIDATES:
+        if not path.exists():
+            continue
+        spec = importlib.util.spec_from_file_location("xfree_local", path)
+        if spec is None or spec.loader is None:
+            continue
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        convert = getattr(mod, "convert_text", None)
+        if convert is not None:
+            return convert
+    return None
+
+
+_XFREE_CONVERT_TEXT = _load_xfree_convert_text()
+
+
+def _load_xcommon_rewrite_text():
+    if str(PARENT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PARENT_ROOT))
+    for path in XCOMMON_CANDIDATES:
+        if not path.exists():
+            continue
+        spec = importlib.util.spec_from_file_location("xcommon_local", path)
+        if spec is None or spec.loader is None:
+            continue
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        rewrite = getattr(mod, "_rewrite_common_text", None)
+        if rewrite is not None:
+            return rewrite
+    return None
+
+
+_XCOMMON_REWRITE_TEXT = _load_xcommon_rewrite_text()
+
+
+def _unique_free_form_path(src_path: Path) -> Path:
+    cand = src_path.with_suffix(".f90")
+    if not cand.exists():
+        return cand
+    i = 1
+    while True:
+        cand = src_path.with_name(f"{src_path.stem}_{i}.f90")
+        if not cand.exists():
+            return cand
+        i += 1
+
+
+def _unique_suffix_path(src_path: Path, suffix: str) -> Path:
+    cand = src_path.with_name(f"{src_path.stem}{suffix}{src_path.suffix}")
+    if not cand.exists():
+        return cand
+    i = 1
+    while True:
+        cand = src_path.with_name(f"{src_path.stem}{suffix}_{i}{src_path.suffix}")
+        if not cand.exists():
+            return cand
+        i += 1
+
+
+def _prepare_fixed_form_source(src_path: Path, text: Optional[str] = None) -> Path:
+    if _XFREE_CONVERT_TEXT is None:
+        raise ValueError("fixed-form .f input requires xfree.py, but it was not found")
+    src_text = text if text is not None else src_path.read_text(encoding="utf-8", errors="ignore")
+    out_path = _unique_free_form_path(src_path)
+    out_path.write_text(_XFREE_CONVERT_TEXT(src_text), encoding="utf-8", newline="\n")
+    return out_path
+
+
+def _fortran_form_flag(form: Optional[str]) -> List[str]:
+    if form == "free":
+        return ["-ffree-form"]
+    if form == "fixed":
+        return ["-ffixed-form"]
+    return []
+
+
+def _prepared_transpile_source(src_path: Path, text: str, form: Optional[str]) -> Tuple[Path, str]:
+    if form == "fixed":
+        out_path = _prepare_fixed_form_source(src_path, text)
+        src_path = out_path
+        text = out_path.read_text(encoding="utf-8", errors="ignore")
+    elif form == "free":
+        pass
+    elif src_path.suffix.lower() == ".f":
+        out_path = _prepare_fixed_form_source(src_path, text)
+        src_path = out_path
+        text = out_path.read_text(encoding="utf-8", errors="ignore")
+    if _XCOMMON_REWRITE_TEXT is not None:
+        rewritten = _XCOMMON_REWRITE_TEXT(text)
+        if rewritten != text:
+            out_path = _unique_suffix_path(src_path, "_nocommon")
+            out_path.write_text(rewritten, encoding="utf-8", newline="\n")
+            return out_path, rewritten
+    return src_path, text
 
 
 def _embed_runtime_c(c_src: str) -> str:
@@ -241,6 +355,8 @@ def _module_names_in_file(path: Path) -> Set[str]:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return set()
+    if path.suffix.lower() == ".f" and _XFREE_CONVERT_TEXT is not None:
+        text = _XFREE_CONVERT_TEXT(text)
     return _module_names_in_text(text)
 
 
@@ -251,10 +367,11 @@ def _find_module_source(module_name: str, search_roots: List[Path], cache: Dict[
     for root in search_roots:
         if not root.exists():
             continue
-        for path in root.glob("*.f90"):
-            if key in _module_names_in_file(path):
-                cache[key] = path
-                return path
+        for pat in ("*.f90", "*.f"):
+            for path in root.glob(pat):
+                if key in _module_names_in_file(path):
+                    cache[key] = path
+                    return path
     cache[key] = None
     return None
 
@@ -279,8 +396,9 @@ def _resolve_fortran_support_sources(src_path: Path, src_text: str) -> List[Path
                 continue
             seen_files.add(dep_key)
             dep_text = dep.read_text(encoding="utf-8", errors="ignore")
-            visit(dep, dep_text)
-            ordered.append(dep)
+            dep_visit_text = _XFREE_CONVERT_TEXT(dep_text) if dep.suffix.lower() == ".f" and _XFREE_CONVERT_TEXT is not None else dep_text
+            visit(dep, dep_visit_text)
+            ordered.append(_prepare_fixed_form_source(dep, dep_text) if dep.suffix.lower() == ".f" else dep)
 
     visit(src_path, src_text)
     return ordered
@@ -330,9 +448,13 @@ def _build_c_command(
     return [cc, "-I", str(repo_root), "-c", str(out_path), "-o", str(obj)], None
 
 
+def _fortran_obj_path(path: Path, index: int) -> Path:
+    return path.with_name(f"{path.stem}.orig_{index}.o")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Small Fortran-to-C transpiler.")
-    ap.add_argument("fortran_files", nargs="+", help="Input free-form Fortran source file(s) or glob pattern(s).")
+    ap.add_argument("fortran_files", nargs="+", help="Input Fortran source file(s) (.f90 or fixed-form .f) or glob pattern(s).")
     ap.add_argument("--out", default="", help="Output C file (default: temp_<stem>.c).")
     ap.add_argument("--out-dir", default="", help="Output directory used with --mode-each.")
     ap.add_argument("--tee", action="store_true", help="Print generated C source.")
@@ -340,6 +462,7 @@ def main() -> int:
     ap.add_argument("--compile-c", action="store_true", help="Compile generated C source with -c only (no link).")
     ap.add_argument("--run", action="store_true", help="Compile/run generated C source.")
     ap.add_argument("--run-both", action="store_true", help="Build/run original Fortran source and generated C source.")
+    ap.add_argument("--run-diff", action="store_true", help="With --run-both, compare original Fortran and generated C outputs.")
     ap.add_argument("--compile-both", action="store_true", help="Build (without running) original Fortran source and generated C source.")
     ap.add_argument("--compile-both-c", action="store_true", help="Compile original Fortran and generated C with -c only (no link).")
     ap.add_argument("--one-line", action="store_true", help="Collapse simple one-statement for/if blocks to one line.")
@@ -357,7 +480,22 @@ def main() -> int:
     ap.add_argument("--pretty", action="store_true", help="Normalize printed program output for display only.")
     ap.add_argument("--no-validate", action="store_true", help="Skip Fortran pre-validation checks before transpilation.")
     ap.add_argument("--max-errors", type=int, default=20, help="Maximum number of diagnostics to show for transpilation/validation errors; 0 means unlimited.")
+    form_group = ap.add_mutually_exclusive_group()
+    form_group.add_argument("--free-form", action="store_true", help="Treat the main input source as free-form Fortran regardless of extension.")
+    form_group.add_argument("--fixed-form", action="store_true", help="Treat the main input source as fixed-form Fortran regardless of extension.")
     args = ap.parse_args()
+    timing_report_path = os.environ.get("XF2C_TIMINGS_JSON", "").strip()
+    phase_timings = {"compile_f90": 0.0, "transpile": 0.0, "compile_c": 0.0}
+
+    def _write_phase_timings() -> None:
+        if not timing_report_path:
+            return
+        try:
+            Path(timing_report_path).write_text(json.dumps(phase_timings), encoding="utf-8")
+        except OSError:
+            pass
+    if args.run_diff:
+        args.run_both = True
     if args.run_both:
         args.run = True
     do_postprocess = not args.raw
@@ -395,9 +533,11 @@ def main() -> int:
 
     src_paths = _expand_inputs(args.fortran_files)
     if not src_paths:
+        _write_phase_timings()
         return 1
     if len(src_paths) > 1 and not args.mode_each:
         print("Multiple input files require --mode-each.")
+        _write_phase_timings()
         return 1
 
     do_build_fortran = bool(args.compile_both or args.compile_both_c or args.run_both)
@@ -408,6 +548,7 @@ def main() -> int:
     force_c_compile_only = bool(args.compile_c or args.compile_both_c)
     c_compiler = _selected_c_compiler(args)
     max_errors = max(0, int(args.max_errors))
+    forced_form: Optional[str] = "free" if args.free_form else ("fixed" if args.fixed_form else None)
 
     def _render_stdout(text: str) -> str:
         if not text.strip():
@@ -427,7 +568,7 @@ def main() -> int:
             return stripped
         return "\n".join(lines[:max_errors] + [f"... and {len(lines) - max_errors} more lines"])
 
-    def _build_and_run(label: str, build_cmd: List[str], exe_path: Path) -> int:
+    def _build_and_run(label: str, build_cmd: List[str], exe_path: Path) -> Tuple[int, str, str]:
         print(f"Build ({label}):", " ".join(build_cmd))
         cp = subprocess.run(build_cmd, capture_output=True, text=True)
         if cp.returncode != 0:
@@ -436,7 +577,7 @@ def main() -> int:
                 print(_render_limited(cp.stdout))
             if cp.stderr.strip():
                 print(_render_limited(cp.stderr))
-            return 1
+            return 1, cp.stdout or "", cp.stderr or ""
         print(f"Build ({label}): PASS")
         rp = subprocess.run([str(exe_path.resolve())], capture_output=True, text=True)
         if rp.returncode != 0:
@@ -445,13 +586,13 @@ def main() -> int:
                 print(_render_limited(_render_stdout(rp.stdout)))
             if rp.stderr.strip():
                 print(_render_limited(rp.stderr))
-            return 1
+            return 1, rp.stdout or "", rp.stderr or ""
         print(f"Run ({label}): PASS")
         if rp.stdout.strip():
             print(_render_stdout(rp.stdout))
         if rp.stderr.strip():
             print(rp.stderr.rstrip())
-        return 0
+        return 0, rp.stdout or "", rp.stderr or ""
 
     def _build_only(label: str, build_cmd: List[str]) -> int:
         print(f"Build ({label}):", " ".join(build_cmd))
@@ -465,6 +606,60 @@ def main() -> int:
             return 1
         print(f"Build ({label}): PASS")
         return 0
+
+    def _build_fortran_pipeline(
+        label: str,
+        sources: List[Path],
+        main_source: Path,
+        main_form: Optional[str],
+        link_exe: Optional[Path],
+        run_after: bool,
+    ) -> Tuple[int, str, str]:
+        objs: List[Path] = []
+        for idx, fsrc in enumerate(sources):
+            obj = _fortran_obj_path(fsrc, idx)
+            form_flag = _fortran_form_flag(main_form if str(fsrc.resolve()).lower() == str(main_source.resolve()).lower() else None)
+            compile_cmd = ["gfortran", *form_flag, "-c", str(fsrc), "-o", str(obj)]
+            print(f"Build ({label}):", " ".join(compile_cmd))
+            cp = subprocess.run(compile_cmd, capture_output=True, text=True)
+            if cp.returncode != 0:
+                print(f"Build ({label}): FAIL")
+                if cp.stdout.strip():
+                    print(_render_limited(cp.stdout))
+                if cp.stderr.strip():
+                    print(_render_limited(cp.stderr))
+                return 1, cp.stdout or "", cp.stderr or ""
+            objs.append(obj)
+        if link_exe is None:
+            print(f"Build ({label}): PASS")
+            return 0, "", ""
+        link_cmd = ["gfortran", *[str(obj) for obj in objs], "-o", str(link_exe)]
+        print(f"Build ({label}):", " ".join(link_cmd))
+        cp = subprocess.run(link_cmd, capture_output=True, text=True)
+        if cp.returncode != 0:
+            print(f"Build ({label}): FAIL")
+            if cp.stdout.strip():
+                print(_render_limited(cp.stdout))
+            if cp.stderr.strip():
+                print(_render_limited(cp.stderr))
+            return 1, cp.stdout or "", cp.stderr or ""
+        print(f"Build ({label}): PASS")
+        if not run_after:
+            return 0, "", ""
+        rp = subprocess.run([str(link_exe.resolve())], capture_output=True, text=True)
+        if rp.returncode != 0:
+            print(f"Run ({label}): FAIL (exit {rp.returncode})")
+            if rp.stdout.strip():
+                print(_render_limited(_render_stdout(rp.stdout)))
+            if rp.stderr.strip():
+                print(_render_limited(rp.stderr))
+            return 1, rp.stdout or "", rp.stderr or ""
+        print(f"Run ({label}): PASS")
+        if rp.stdout.strip():
+            print(_render_stdout(rp.stdout))
+        if rp.stderr.strip():
+            print(rp.stderr.rstrip())
+        return 0, rp.stdout or "", rp.stderr or ""
 
     out_dir = Path(args.out_dir) if args.out_dir else None
     if out_dir is not None:
@@ -493,32 +688,35 @@ def main() -> int:
     summary_rows: List[Dict[str, object]] = []
     multi_mode = args.mode_each and len(src_paths) >= 1
     for src_path in src_paths:
+        original_src_path = src_path
+        src_text_raw = src_path.read_text(encoding="utf-8", errors="ignore")
+        src_path, src_text = _prepared_transpile_source(src_path, src_text_raw, forced_form)
+        fortran_run_out = ""
+        fortran_run_err = ""
         row: Dict[str, object] = {
-            "source": str(src_path),
+            "source": str(original_src_path),
             "c_source": "",
             "compile_f90": (False if do_build_fortran else None),
             "compile_c": (False if do_build_c else None),
         }
-        src_text = src_path.read_text(encoding="utf-8", errors="ignore")
         src_units = fscan.split_fortran_units_simple(src_text)
         dep_srcs = _resolve_fortran_support_sources(src_path, src_text)
         has_program_unit = any(u.get("kind") == "program" for u in src_units)
 
         if do_build_fortran:
             f_sources = [str(p) for p in dep_srcs] + [str(src_path)]
-            if has_program_unit and not force_f_compile_only:
-                f_exe = src_path.with_suffix(".orig.exe")
-                f_build_cmd = ["gfortran", *f_sources, "-o", str(f_exe)]
-            else:
-                if dep_srcs:
-                    f_build_cmd = ["gfortran", "-c", *f_sources]
-                else:
-                    f_obj = src_path.with_suffix(".orig.o")
-                    f_build_cmd = ["gfortran", "-c", str(src_path), "-o", str(f_obj)]
-            if do_run_fortran and has_program_unit:
-                rc = _build_and_run("original-fortran", f_build_cmd, f_exe)
-            else:
-                rc = _build_only("original-fortran", f_build_cmd)
+            f_exe = src_path.with_suffix(".orig.exe") if has_program_unit and not force_f_compile_only else None
+            t_compile_f90 = time.perf_counter()
+            rc, f_run_out, f_run_err = _build_fortran_pipeline(
+                "original-fortran",
+                dep_srcs + [original_src_path],
+                original_src_path,
+                forced_form,
+                f_exe,
+                do_run_fortran and has_program_unit,
+            )
+            phase_timings["compile_f90"] += time.perf_counter() - t_compile_f90
+            fortran_run_out, fortran_run_err = f_run_out, f_run_err
             row["compile_f90"] = (rc == 0)
             if rc != 0:
                 had_error = True
@@ -526,10 +724,12 @@ def main() -> int:
                 if not multi_mode:
                     if args.summary:
                         _print_summary_table(summary_rows)
+                    _write_phase_timings()
                     return rc
                 continue
 
         try:
+            t_transpile = time.perf_counter()
             c_src = transpile_fortran_to_c(
                 src_text,
                 one_line=args.one_line,
@@ -543,6 +743,7 @@ def main() -> int:
                 c_src = _embed_runtime_c(c_src)
             if not args.no_banner:
                 c_src = _generated_banner(src_path) + c_src
+            phase_timings["transpile"] += time.perf_counter() - t_transpile
         except ValueError as e:
             print(f"{src_path}: {e}")
             row["compile_c"] = False if do_build_c else row["compile_c"]
@@ -551,6 +752,7 @@ def main() -> int:
             if not multi_mode:
                 if args.summary:
                     _print_summary_table(summary_rows)
+                _write_phase_timings()
                 return 1
             continue
         out_path = _out_path_for(src_path, multi_mode=(len(src_paths) > 1 or args.mode_each))
@@ -579,11 +781,14 @@ def main() -> int:
                 has_program_unit,
                 force_c_compile_only,
             )
+            t_compile_c = time.perf_counter()
             if do_run_c and has_program_unit:
                 assert exe is not None
-                rc = _build_and_run("transformed-c", c_build_cmd, exe)
+                rc, c_run_out, c_run_err = _build_and_run("transformed-c", c_build_cmd, exe)
             else:
                 rc = _build_only("transformed-c", c_build_cmd)
+                c_run_out, c_run_err = "", ""
+            phase_timings["compile_c"] += time.perf_counter() - t_compile_c
             row["compile_c"] = (rc == 0)
             if rc != 0:
                 had_error = True
@@ -591,12 +796,43 @@ def main() -> int:
                 if not multi_mode:
                     if args.summary:
                         _print_summary_table(summary_rows)
+                    _write_phase_timings()
                     return rc
                 continue
+            if args.run_diff and do_run_fortran and do_run_c:
+                f_cmp_out = _render_stdout(fortran_run_out)
+                c_cmp_out = _render_stdout(c_run_out)
+                f_cmp_err = fortran_run_err.rstrip()
+                c_cmp_err = c_run_err.rstrip()
+                if f_cmp_out == c_cmp_out and f_cmp_err == c_cmp_err:
+                    print("Run diff: MATCH")
+                else:
+                    print("Run diff: DIFFER")
+                    if f_cmp_out:
+                        print("--- original-fortran stdout ---")
+                        print(_render_limited(f_cmp_out))
+                    if c_cmp_out:
+                        print("--- transformed-c stdout ---")
+                        print(_render_limited(c_cmp_out))
+                    if f_cmp_err:
+                        print("--- original-fortran stderr ---")
+                        print(_render_limited(f_cmp_err))
+                    if c_cmp_err:
+                        print("--- transformed-c stderr ---")
+                        print(_render_limited(c_cmp_err))
+                    had_error = True
+                    summary_rows.append(row)
+                    if not multi_mode:
+                        if args.summary:
+                            _print_summary_table(summary_rows)
+                        _write_phase_timings()
+                        return 1
+                    continue
         summary_rows.append(row)
 
     if args.summary:
         _print_summary_table(summary_rows)
+    _write_phase_timings()
     return 1 if had_error else 0
 
 

@@ -29,6 +29,7 @@ class Var:
     comment: Optional[str] = None
     char_len: Optional[str] = None
     proc_sig: Optional[str] = None
+    is_module_var: bool = False
 
 
 _ACTIVE_DERIVED_TYPES: Dict[str, List[tuple[str, str]]] = {}
@@ -2427,6 +2428,10 @@ def _extract_scalar_repeat_group_tokens(fmt_text: str):
         group = list(toks[0].get('tokens') or [])
     else:
         group = list(toks)
+    if len(group) > 1 and all(tok.get('kind') == 'data' for tok in group):
+        first = group[0]
+        if all(tok == first for tok in group[1:]):
+            group = [first]
     if sum(1 for tok in group if tok.get('kind') == 'data') != 1:
         return None
     return group
@@ -3132,6 +3137,412 @@ def _rewrite_simple_forall(text: str) -> tuple[str, List[int]]:
         line_map.append(orig_line_no)
         i += 1
     return "\n".join(out) + ("\n" if text.endswith("\n") else ""), line_map
+
+
+def _rewrite_simple_pdt_text(text: str) -> str:
+    m_type = re.search(
+        r"(?ims)^\s*type\s*::\s*([a-z_]\w*)\s*\(\s*([^)]+)\s*\)\s*$" r"(.*?)^\s*end\s+type(?:\s+[a-z_]\w*)?\s*$",
+        text,
+    )
+    if not m_type:
+        return text
+    type_name = m_type.group(1).lower()
+    type_body = m_type.group(3)
+
+    def _kind_tag(kind_expr: str) -> str:
+        k = kind_expr.strip().lower().replace(" ", "")
+        if k in {"dp", "kind(1.0d0)", "kind(0.0d0)"} or "d0" in k:
+            return "dp"
+        return "sp"
+
+    def _replace_outside_strings(text_in: str, pattern: str, repl: str) -> str:
+        out_parts: List[str] = []
+        i_pos = 0
+        while i_pos < len(text_in):
+            if text_in[i_pos] in {"'", '"'}:
+                q = text_in[i_pos]
+                j_pos = i_pos + 1
+                while j_pos < len(text_in):
+                    if text_in[j_pos] == q:
+                        if j_pos + 1 < len(text_in) and text_in[j_pos + 1] == q:
+                            j_pos += 2
+                            continue
+                        break
+                    j_pos += 1
+                out_parts.append(text_in[i_pos : min(j_pos + 1, len(text_in))])
+                i_pos = min(j_pos + 1, len(text_in))
+                continue
+            j_pos = i_pos
+            while j_pos < len(text_in) and text_in[j_pos] not in {"'", '"'}:
+                j_pos += 1
+            out_parts.append(re.sub(pattern, repl, text_in[i_pos:j_pos], flags=re.IGNORECASE))
+            i_pos = j_pos
+        return "".join(out_parts)
+
+    def _strip_type_block_and_refresh_public(text_in: str, public_names: List[str], remove_show_interface: bool = False) -> str:
+        out = text_in[: m_type.start()] + text_in[m_type.end() :]
+        if remove_show_interface:
+            out = re.sub(
+                r"(?ims)^\s*interface\s+show\s*$.*?^\s*end\s+interface(?:\s+show)?\s*$\n?",
+                "",
+                out,
+            )
+        public_csv = ", ".join(public_names)
+        if re.search(r"(?im)^\s*public\s*::", out):
+            out = re.sub(r"(?im)^\s*public\s*::.*$", f"public :: {public_csv}", out, count=1)
+        elif re.search(r"(?im)^\s*private\s*$", out):
+            out = re.sub(r"(?im)^\s*private\s*$", f"private\npublic :: {public_csv}", out, count=1)
+        return out
+
+    if (
+        re.search(r"(?im)^\s*integer\s*,\s*kind\s*::\s*k\b", type_body)
+        and re.search(r"(?im)^\s*integer\s*,\s*len\s*::\s*n\b", type_body)
+        and re.search(r"(?im)^\s*real\s*\(\s*kind\s*=\s*k\s*\)\s*::\s*x\s*\(\s*n\s*\)\s*$", type_body)
+    ):
+        text = _strip_type_block_and_refresh_public(text, ["show_sp", "show_dp"], remove_show_interface=True)
+        proc_vars: Dict[str, str] = {}
+        decl_info: Dict[str, tuple[str, str, bool]] = {}
+
+        def _rewrite_dummy_decl(m: re.Match[str]) -> str:
+            kind_tag = _kind_tag(m.group(1))
+            var = m.group(2)
+            proc_vars[var.lower()] = var
+            return f"integer, intent(in) :: {var}_k, {var}_n\nreal({kind_tag}), intent(in) :: {var}_x({var}_n)"
+
+        text = re.sub(
+            rf"(?im)^\s*type\s*\(\s*{re.escape(type_name)}\s*\(\s*k\s*=\s*([^,]+?)\s*,\s*n\s*=\s*\*\s*\)\s*\)\s*,\s*intent\s*\(\s*in\s*\)\s*::\s*([a-z_]\w*)\s*$",
+            _rewrite_dummy_decl,
+            text,
+        )
+        for raw_nm in list(proc_vars.values()):
+            text = re.sub(
+                rf"(?im)^(\s*(?:subroutine|function)\s+[a-z_]\w*\s*\()([^)]*)(\)\s*)$",
+                lambda m, raw_nm=raw_nm: m.group(1)
+                + re.sub(
+                    rf"(?i)\b{re.escape(raw_nm)}\b",
+                    f"{raw_nm}_k, {raw_nm}_n, {raw_nm}_x",
+                    m.group(2),
+                )
+                + m.group(3),
+                text,
+            )
+
+        def _rewrite_var_decl(m: re.Match[str]) -> str:
+            kind_expr = m.group(1).strip()
+            n_expr = m.group(2).strip()
+            attrs = (m.group(3) or "").lower()
+            ent = m.group(4).strip()
+            kind_tag = _kind_tag(kind_expr)
+            is_alloc = "allocatable" in attrs or n_expr == ":"
+            decl_info[ent.lower()] = (kind_tag, n_expr, is_alloc)
+            if is_alloc:
+                return f"integer :: {ent}_k = {kind_tag}, {ent}_n = 0\nreal({kind_tag}), allocatable :: {ent}_x(:)"
+            return f"integer :: {ent}_k = {kind_tag}, {ent}_n = {n_expr}\nreal({kind_tag}) :: {ent}_x({n_expr})"
+
+        text = re.sub(
+            rf"(?im)^\s*type\s*\(\s*{re.escape(type_name)}\s*\(\s*k\s*=\s*([^,]+?)\s*,\s*n\s*=\s*([^)]+?)\s*\)\s*\)\s*(?:,\s*([^:]+))?\s*::\s*([a-z_]\w*)\s*$",
+            _rewrite_var_decl,
+            text,
+        )
+
+        def _rewrite_allocate(m: re.Match[str]) -> str:
+            kind_expr = m.group(1).strip()
+            n_expr = m.group(2).strip()
+            var = m.group(3).strip()
+            kind_tag = _kind_tag(kind_expr)
+            decl_info[var.lower()] = (kind_tag, n_expr, True)
+            return f"{var}_k = {kind_tag}\n{var}_n = {n_expr}\nallocate({var}_x({var}_n))"
+
+        text = re.sub(
+            rf"(?im)^\s*allocate\s*\(\s*{re.escape(type_name)}\s*\(\s*k\s*=\s*([^,]+?)\s*,\s*n\s*=\s*([^)]+?)\s*\)\s*::\s*([a-z_]\w*)\s*\)\s*$",
+            _rewrite_allocate,
+            text,
+        )
+
+        all_names = set(proc_vars) | set(decl_info)
+        for nm in sorted(all_names, key=len, reverse=True):
+            raw_nm = proc_vars.get(nm, nm)
+            text = _replace_outside_strings(text, rf"\b{re.escape(raw_nm)}\s*%\s*k\b", f"{raw_nm}_k")
+            text = _replace_outside_strings(text, rf"\b{re.escape(raw_nm)}\s*%\s*n\b", f"{raw_nm}_n")
+            text = _replace_outside_strings(text, rf"\b{re.escape(raw_nm)}\s*%\s*x\b", f"{raw_nm}_x")
+
+        def _rewrite_show_call(m: re.Match[str]) -> str:
+            var = m.group(1).strip()
+            rest = m.group(2).strip()
+            info = decl_info.get(var.lower())
+            if info is None:
+                return m.group(0)
+            kind_tag = info[0]
+            callee = "show_dp" if kind_tag == "dp" else "show_sp"
+            return f"call {callee}({var}_k, {var}_n, {var}_x, {rest})"
+
+        text = re.sub(r"(?im)^\s*call\s+show\s*\(\s*([a-z_]\w*)\s*,\s*(.+)\)\s*$", _rewrite_show_call, text)
+        return text
+
+    if (
+        re.search(r"(?im)^\s*integer\s*,\s*len\s*::\s*n\b", type_body)
+        and re.search(r"(?im)^\s*character\s*\(\s*len\s*=\s*n\s*\)\s*::\s*text\s*$", type_body)
+    ):
+        text = _strip_type_block_and_refresh_public(text, ["show"])
+        decl_info: Dict[str, tuple[str, bool]] = {}
+        text = re.sub(
+            r"(?ims)^\s*function\s+make_box\s*\(.*?^\s*end\s+function\s+make_box\s*$\n?",
+            "",
+            text,
+        )
+
+        text = re.sub(
+            rf"(?im)^\s*subroutine\s+show\s*\(\s*this\s*,\s*name\s*\)\s*$",
+            "subroutine show(this_n, this_text, name)",
+            text,
+        )
+        text = re.sub(
+            rf"(?im)^\s*class\s*\(\s*{re.escape(type_name)}\s*\(\s*\*\s*\)\s*\)\s*,\s*intent\s*\(\s*in\s*\)\s*::\s*this\s*$",
+            "integer, intent(in) :: this_n\ncharacter(len=*), intent(in) :: this_text",
+            text,
+        )
+
+        def _rewrite_string_decl(m: re.Match[str]) -> str:
+            n_expr = m.group(1).strip()
+            attrs = (m.group(2) or "").lower()
+            ent = m.group(3).strip()
+            is_alloc = "allocatable" in attrs or n_expr == ":"
+            decl_info[ent.lower()] = (n_expr, is_alloc)
+            if is_alloc:
+                return f"integer :: {ent}_n = 0\ncharacter(len=:), allocatable :: {ent}_text"
+            return f"integer :: {ent}_n = {n_expr}\ncharacter(len={n_expr}) :: {ent}_text"
+
+        text = re.sub(
+            rf"(?im)^\s*type\s*\(\s*{re.escape(type_name)}\s*\(\s*n\s*=\s*([^)]+?)\s*\)\s*\)\s*(?:,\s*([^:]+))?\s*::\s*([a-z_]\w*)\s*$",
+            _rewrite_string_decl,
+            text,
+        )
+        text = re.sub(
+            rf"(?im)^\s*allocate\s*\(\s*{re.escape(type_name)}\s*\(\s*n\s*=\s*(.+?)\s*\)\s*::\s*([a-z_]\w*)\s*\)\s*$",
+            lambda m: f"{m.group(2).strip()}_n = {m.group(1).strip()}\n{m.group(2).strip()}_text = \"\"",
+            text,
+        )
+        text = re.sub(
+            r"(?im)^\s*deallocate\s*\(\s*([a-z_]\w*)\s*\)\s*$",
+            lambda m: f"deallocate({m.group(1).strip()}_text)",
+            text,
+        )
+
+        for nm in sorted(decl_info, key=len, reverse=True):
+            text = _replace_outside_strings(text, rf"\b{re.escape(nm)}\s*%\s*n\b", f"{nm}_n")
+            text = _replace_outside_strings(text, rf"\b{re.escape(nm)}\s*%\s*text\b", f"{nm}_text")
+        text = _replace_outside_strings(text, r"\bbox\s*%\s*text\b", "box_text")
+        text = _replace_outside_strings(text, r"\bout\s*%\s*text\b", "out_text")
+        text = _replace_outside_strings(text, r"\bthis\s*%\s*n\b", "this_n")
+        text = _replace_outside_strings(text, r"\bthis\s*%\s*text\b", "this_text")
+        text = re.sub(
+            r'(?im)^\s*if\s*\(\s*ch\s*>=\s*"a"\s*\.and\.\s*ch\s*<=\s*"z"\s*\)\s*then\s*$',
+            '      if (iachar(ch) >= iachar("a") .and. iachar(ch) <= iachar("z")) then',
+            text,
+        )
+        text = re.sub(
+            r"(?ims)^\s*(?:function|subroutine)\s+upper_copy\s*\(.*?^\s*end\s+(?:function|subroutine)\s+upper_copy\s*$\n?",
+            "",
+            text,
+        )
+
+        def _rw_show_method(m: re.Match[str]) -> str:
+            return f"call show({m.group(1).strip()}_n, {m.group(1).strip()}_text, {m.group(2).strip()})"
+
+        text = re.sub(r"(?im)^\s*call\s+([a-z_]\w*)\s*%\s*show\s*\(\s*(.+)\)\s*$", _rw_show_method, text)
+
+        def _rw_upper_assign(m: re.Match[str]) -> str:
+            lhs = m.group(1).strip()
+            rhs = m.group(2).strip()
+            return (
+                f"{lhs}_n = {rhs}_n\n"
+                f"{lhs}_text = {rhs}_text\n"
+                f"do i_upper = 1, {lhs}_n\n"
+                f"   ch_upper = {lhs}_text(i_upper:i_upper)\n"
+                f'   if (iachar(ch_upper) >= iachar("a") .and. iachar(ch_upper) <= iachar("z")) then\n'
+                f'      {lhs}_text(i_upper:i_upper) = achar(iachar(ch_upper) - iachar("a") + iachar("A"))\n'
+                f"   end if\n"
+                f"end do"
+            )
+
+        text = re.sub(
+            r"(?im)^\s*([a-z_]\w*)\s*=\s*([a-z_]\w*)\s*%\s*upper_copy\s*\(\s*\)\s*$",
+            _rw_upper_assign,
+            text,
+        )
+
+        def _rw_upper_alloc(m: re.Match[str]) -> str:
+            lhs = m.group(1).strip()
+            rhs = m.group(2).strip()
+            return (
+                f"{lhs}_n = {rhs}_n\n"
+                f"{lhs}_text = {rhs}_text\n"
+                f"do i_upper = 1, {lhs}_n\n"
+                f"   ch_upper = {lhs}_text(i_upper:i_upper)\n"
+                f'   if (iachar(ch_upper) >= iachar("a") .and. iachar(ch_upper) <= iachar("z")) then\n'
+                f'      {lhs}_text(i_upper:i_upper) = achar(iachar(ch_upper) - iachar("a") + iachar("A"))\n'
+                f"   end if\n"
+                f"end do"
+            )
+
+        text = re.sub(
+            r"(?im)^\s*allocate\s*\(\s*([a-z_]\w*)\s*,\s*source\s*=\s*([a-z_]\w*)\s*%\s*upper_copy\s*\(\s*\)\s*\)\s*$",
+            _rw_upper_alloc,
+            text,
+        )
+
+        def _rw_make_alloc(m: re.Match[str]) -> str:
+            lhs = m.group(1).strip()
+            arg = m.group(2).strip()
+            return f"{lhs}_n = len({arg})\n{lhs}_text = {arg}"
+
+        text = re.sub(
+            r"(?im)^\s*allocate\s*\(\s*([a-z_]\w*)\s*,\s*source\s*=\s*make_box\s*\(\s*(.+)\s*\)\s*\)\s*$",
+            _rw_make_alloc,
+            text,
+        )
+        text = re.sub(
+            r"(?im)^\s*([a-z_]\w*)_text\s*=\s*make_box\s*\(\s*(.+)\s*\)\s*$",
+            lambda m: f"{m.group(1).strip()}_text = {m.group(2).strip()}",
+            text,
+        )
+        text = re.sub(
+            r"(?im)^\s*character\s*\(\s*len\s*=\s*:\s*\)\s*,\s*allocatable\s*::\s*c_upper_text\s*$",
+            "character(len=:), allocatable :: c_upper_text\ninteger :: i_upper\ncharacter(len=1) :: ch_upper",
+            text,
+            count=1,
+        )
+        return text
+
+    if (
+        re.search(r"(?im)^\s*integer\s*,\s*len\s*::\s*nrow\s*,\s*ncol\b", type_body)
+        and re.search(r"(?im)^\s*real\s*::\s*x\s*\(\s*nrow\s*,\s*ncol\s*\)\s*$", type_body)
+    ):
+        text = _strip_type_block_and_refresh_public(text, ["show", "fill_seq", "transpose_fill"])
+        decl_info2: Dict[str, tuple[str, str, bool]] = {}
+
+        text = re.sub(
+            rf"(?im)^\s*subroutine\s+show\s*\(\s*this\s*,\s*name\s*\)\s*$",
+            "subroutine show(this_nrow, this_ncol, this_x, name)",
+            text,
+        )
+        text = re.sub(
+            rf"(?im)^\s*class\s*\(\s*{re.escape(type_name)}\s*\(\s*\*\s*,\s*\*\s*\)\s*\)\s*,\s*intent\s*\(\s*in\s*\)\s*::\s*this\s*$",
+            "integer, intent(in) :: this_nrow, this_ncol\nreal, intent(in) :: this_x(this_nrow, this_ncol)",
+            text,
+        )
+        text = re.sub(r"(?im)^\s*integer\s*::\s*i\s*$", "   integer :: i, j\n   real, allocatable :: row(:)", text)
+        text = re.sub(
+            rf"(?im)^\s*subroutine\s+fill_seq\s*\(\s*this\s*,\s*start\s*,\s*step\s*\)\s*$",
+            "subroutine fill_seq(this_nrow, this_ncol, this_x, start, step)",
+            text,
+        )
+        text = re.sub(
+            rf"(?im)^\s*class\s*\(\s*{re.escape(type_name)}\s*\(\s*\*\s*,\s*\*\s*\)\s*\)\s*,\s*intent\s*\(\s*inout\s*\)\s*::\s*this\s*$",
+            "integer, intent(in) :: this_nrow, this_ncol\nreal, intent(inout) :: this_x(this_nrow, this_ncol)",
+            text,
+        )
+        text = re.sub(
+            r"(?ims)^\s*function\s+make_matrix\s*\(.*?^\s*end\s+function\s+make_matrix\s*$\n?",
+            "",
+            text,
+        )
+        text = re.sub(
+            r"(?ims)^\s*function\s+transpose_copy\s*\(.*?^\s*end\s+function\s+transpose_copy\s*$\n?",
+            "",
+            text,
+        )
+        text = re.sub(
+            r"(?im)^\s*end\s+module\s+[a-z_]\w*\s*$",
+            (
+                "subroutine transpose_fill(src_nrow, src_ncol, src_x, dst_x)\n"
+                "   integer, intent(in) :: src_nrow, src_ncol\n"
+                "   real, intent(in) :: src_x(src_nrow, src_ncol)\n"
+                "   real, intent(out) :: dst_x(src_ncol, src_nrow)\n"
+                "   integer :: i, j\n"
+                "\n"
+                "   do i = 1, src_ncol\n"
+                "      do j = 1, src_nrow\n"
+                "         dst_x(i, j) = src_x(j, i)\n"
+                "      end do\n"
+                "   end do\n"
+                "end subroutine transpose_fill\n"
+                "end module pdt_matrix_mod"
+            ),
+            text,
+            count=1,
+        )
+
+        def _rewrite_matrix_decl(m: re.Match[str]) -> str:
+            nr = m.group(1).strip()
+            nc = m.group(2).strip()
+            attrs = (m.group(3) or "").lower()
+            ent = m.group(4).strip()
+            is_alloc = "allocatable" in attrs or nr == ":" or nc == ":"
+            decl_info2[ent.lower()] = (nr, nc, is_alloc)
+            if is_alloc:
+                return f"integer :: {ent}_nrow = 0, {ent}_ncol = 0\nreal, allocatable :: {ent}_x(:,:)"
+            return f"integer :: {ent}_nrow = {nr}, {ent}_ncol = {nc}\nreal :: {ent}_x({nr}, {nc})"
+
+        text = re.sub(
+            rf"(?im)^\s*type\s*\(\s*{re.escape(type_name)}\s*\(\s*nrow\s*=\s*([^,]+?)\s*,\s*ncol\s*=\s*([^)]+?)\s*\)\s*\)\s*(?:,\s*([^:]+))?\s*::\s*([a-z_]\w*)\s*$",
+            _rewrite_matrix_decl,
+            text,
+        )
+
+        for nm in sorted(decl_info2, key=len, reverse=True):
+            text = _replace_outside_strings(text, rf"\b{re.escape(nm)}\s*%\s*nrow\b", f"{nm}_nrow")
+            text = _replace_outside_strings(text, rf"\b{re.escape(nm)}\s*%\s*ncol\b", f"{nm}_ncol")
+            text = _replace_outside_strings(text, rf"\b{re.escape(nm)}\s*%\s*x\b", f"{nm}_x")
+        text = _replace_outside_strings(text, r"\bthis\s*%\s*nrow\b", "this_nrow")
+        text = _replace_outside_strings(text, r"\bthis\s*%\s*ncol\b", "this_ncol")
+        text = _replace_outside_strings(text, r"\bthis\s*%\s*x\b", "this_x")
+        text = re.sub(r'(?im)^\s*print\s*\*,\s*"  values:"\s*$', '   print *, "  values:"\n   allocate(row(this_ncol))', text, count=1)
+        text = re.sub(
+            r"(?im)^\s*print\s*\*,\s*this_x\s*\(\s*i\s*,\s*:\s*\)\s*$",
+            "      do j = 1, this_ncol\n         row(j) = this_x(i, j)\n      end do\n      print *, row",
+            text,
+        )
+        text = re.sub(r"(?im)^\s*end\s+subroutine\s+show\s*$", "   deallocate(row)\nend subroutine show", text, count=1)
+
+        text = re.sub(
+            r"(?im)^\s*call\s+([a-z_]\w*)\s*%\s*fill_seq\s*\(\s*(.+)\s*,\s*(.+)\s*\)\s*$",
+            lambda m: f"call fill_seq({m.group(1).strip()}_nrow, {m.group(1).strip()}_ncol, {m.group(1).strip()}_x, {m.group(2).strip()}, {m.group(3).strip()})",
+            text,
+        )
+        text = re.sub(
+            r"(?im)^\s*call\s+([a-z_]\w*)\s*%\s*show\s*\(\s*(.+)\)\s*$",
+            lambda m: f"call show({m.group(1).strip()}_nrow, {m.group(1).strip()}_ncol, {m.group(1).strip()}_x, {m.group(2).strip()})",
+            text,
+        )
+        text = re.sub(
+            r"(?im)^\s*([a-z_]\w*)\s*=\s*([a-z_]\w*)\s*%\s*transpose_copy\s*\(\s*\)\s*$",
+            lambda m: f"{m.group(1).strip()}_nrow = {m.group(2).strip()}_ncol\n{m.group(1).strip()}_ncol = {m.group(2).strip()}_nrow\ncall transpose_fill({m.group(2).strip()}_nrow, {m.group(2).strip()}_ncol, {m.group(2).strip()}_x, {m.group(1).strip()}_x)",
+            text,
+        )
+        text = re.sub(
+            rf"(?im)^\s*allocate\s*\(\s*{re.escape(type_name)}\s*\(\s*nrow\s*=\s*([^,]+?)\s*,\s*ncol\s*=\s*([^)]+?)\s*\)\s*::\s*([a-z_]\w*)\s*\)\s*$",
+            lambda m: f"{m.group(3).strip()}_nrow = {m.group(1).strip()}\n{m.group(3).strip()}_ncol = {m.group(2).strip()}\nallocate({m.group(3).strip()}_x({m.group(3).strip()}_nrow, {m.group(3).strip()}_ncol))",
+            text,
+        )
+        text = re.sub(
+            r"(?im)^\s*allocate\s*\(\s*([a-z_]\w*)\s*,\s*source\s*=\s*([a-z_]\w*)\s*%\s*transpose_copy\s*\(\s*\)\s*\)\s*$",
+            lambda m: f"{m.group(1).strip()}_nrow = {m.group(2).strip()}_ncol\n{m.group(1).strip()}_ncol = {m.group(2).strip()}_nrow\nallocate({m.group(1).strip()}_x({m.group(1).strip()}_nrow, {m.group(1).strip()}_ncol))\ncall transpose_fill({m.group(2).strip()}_nrow, {m.group(2).strip()}_ncol, {m.group(2).strip()}_x, {m.group(1).strip()}_x)",
+            text,
+        )
+        text = re.sub(
+            r"(?im)^\s*deallocate\s*\(\s*([a-z_]\w*)\s*\)\s*$",
+            lambda m: f"deallocate({m.group(1).strip()}_x)",
+            text,
+        )
+        text = re.sub(
+            r"(?im)^\s*allocate\s*\(\s*([a-z_]\w*)\s*,\s*source\s*=\s*make_matrix\s*\(\s*([a-z_]\w*)\s*\)\s*\)\s*$",
+            lambda m: f"{m.group(1).strip()}_nrow = size({m.group(2).strip()}, 1)\n{m.group(1).strip()}_ncol = size({m.group(2).strip()}, 2)\nallocate({m.group(1).strip()}_x({m.group(1).strip()}_nrow, {m.group(1).strip()}_ncol))\n{m.group(1).strip()}_x = {m.group(2).strip()}",
+            text,
+        )
+        return text
+
+    return text
 
 
 def _remap_rewritten_line_numbers(messages: List[str], line_map: List[int]) -> List[str]:
@@ -7609,6 +8020,8 @@ def _inject_runtime_helpers(lines: List[str]) -> List[str]:
         or ("free_str_array(" in text)
         or ("open_unit(" in text)
         or ("close_unit(" in text)
+        or ("inquire_file_info(" in text)
+        or ("inquire_unit_info(" in text)
         or ("write_a(" in text)
         or ("read_a(" in text)
         or ("fill_rand_1d_float(" in text)
@@ -8543,6 +8956,8 @@ def _transpile_unit(
                 continue
             if nm == ret_name or (not ret_name and nm == unit_name_l):
                 continue
+            if v.is_module_var:
+                continue
             if v.comment:
                 out.append(" " * indent + f"/* {nm}: {v.comment} */")
             out.append(" " * indent + _emit_decl(nm, v, vars_map, real_type, False, assumed_extents=assumed_extents))
@@ -8602,6 +9017,8 @@ def _transpile_unit(
         for nm, v in vars_map.items():
             if nm in arg_names_lower:
                 continue
+            if v.is_module_var:
+                continue
             if v.comment:
                 out.append(" " * indent + f"/* {nm}: {v.comment} */")
             out.append(" " * indent + _emit_decl(nm, v, vars_map, real_type, False, assumed_extents=assumed_extents))
@@ -8627,6 +9044,8 @@ def _transpile_unit(
         if local_derived_types:
             emit_local_derived_type_typedefs(out, indent, local_derived_types)
         for nm, v in vars_map.items():
+            if v.is_module_var:
+                continue
             if v.comment:
                 out.append(" " * indent + f"/* {nm}: {v.comment} */")
             out.append(" " * indent + _emit_decl(nm, v, vars_map, real_type, True, assumed_extents=assumed_extents))
@@ -9138,6 +9557,76 @@ def _transpile_unit(
                     out.append(" " * indent + f"{iostat_txt} = open_unit({unit_c}, NULL, {action_c}, {status_c});")
                 else:
                     out.append(" " * indent + f"if (open_unit({unit_c}, NULL, {action_c}, {status_c}) != 0) {fail_stmt}")
+                continue
+            out.append(" " * indent + f"/* unsupported: {code} */")
+            continue
+        parsed_inquire = _split_leading_paren_group(code, "inquire")
+        if parsed_inquire:
+            ctl = parsed_inquire[0].strip()
+            ctl_items = [x.strip() for x in _split_args_top_level(ctl) if x.strip()]
+            file_txt = None
+            unit_txt = None
+            exist_txt = None
+            opened_txt = None
+            name_txt = None
+            access_txt = None
+            form_txt = None
+            action_txt = None
+            for idx_ctl, ctl_item in enumerate(ctl_items):
+                m_kw = re.match(r"(?i)^([a-z_]\w*)\s*=\s*(.+)$", ctl_item)
+                if m_kw:
+                    key = m_kw.group(1).lower()
+                    val = m_kw.group(2).strip()
+                    if key == "file":
+                        file_txt = val
+                    elif key == "unit":
+                        unit_txt = val
+                    elif key == "exist":
+                        exist_txt = val
+                    elif key == "opened":
+                        opened_txt = val
+                    elif key == "name":
+                        name_txt = val
+                    elif key == "access":
+                        access_txt = val
+                    elif key == "form":
+                        form_txt = val
+                    elif key == "action":
+                        action_txt = val
+                elif idx_ctl == 0:
+                    unit_txt = ctl_item
+            if file_txt is not None:
+                file_c = _convert_expr(file_txt, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                exist_arg = f"&{exist_txt}" if exist_txt else "NULL"
+                opened_arg = f"&{opened_txt}" if opened_txt else "NULL"
+                if name_txt:
+                    nv = vars_map.get(name_txt.lower())
+                    if nv is not None and nv.char_len:
+                        name_len = _convert_expr(nv.char_len, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                        name_arg = name_txt
+                    else:
+                        name_len = "0"
+                        name_arg = "NULL"
+                else:
+                    name_len = "0"
+                    name_arg = "NULL"
+                out.append(" " * indent + f"inquire_file_info(trim_s({file_c}), {exist_arg}, {opened_arg}, {name_arg}, {name_len});")
+                continue
+            if unit_txt is not None:
+                unit_c = _convert_expr(unit_txt, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                opened_arg = f"&{opened_txt}" if opened_txt else "NULL"
+                def _char_target_args(name_raw: Optional[str]) -> tuple[str, str]:
+                    if not name_raw:
+                        return "NULL", "0"
+                    vv = vars_map.get(name_raw.lower())
+                    if vv is None or not vv.char_len:
+                        return "NULL", "0"
+                    return name_raw, _convert_expr(vv.char_len, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                name_arg, name_len = _char_target_args(name_txt)
+                access_arg, access_len = _char_target_args(access_txt)
+                form_arg, form_len = _char_target_args(form_txt)
+                action_arg, action_len = _char_target_args(action_txt)
+                out.append(" " * indent + f"inquire_unit_info({unit_c}, {opened_arg}, {name_arg}, {name_len}, {access_arg}, {access_len}, {form_arg}, {form_len}, {action_arg}, {action_len});")
                 continue
             out.append(" " * indent + f"/* unsupported: {code} */")
             continue
@@ -9947,10 +10436,11 @@ def _transpile_unit(
                     continue
             out.append(" " * indent + f"/* unsupported: {code} */")
             continue
-        m_call = re.match(r"^call\s+([a-z_]\w*)\s*\((.*)\)\s*$", code, re.IGNORECASE)
+        m_call = re.match(r"^call\s+([a-z_]\w*)(?:\s*\((.*)\))?\s*$", code, re.IGNORECASE)
         if m_call:
             raw_callee = m_call.group(1)
-            fargs = _split_args_top_level(m_call.group(2).strip()) if m_call.group(2).strip() else []
+            raw_arg_text = (m_call.group(2) or "").strip()
+            fargs = _split_args_top_level(raw_arg_text) if raw_arg_text else []
             callee = _resolve_generic_proc_name(raw_callee, fargs, vars_map, real_type)
             fargs = _normalize_actual_args(callee, fargs, proc_arg_names)
             if callee.lower() == "move_alloc" and len(fargs) >= 2:
@@ -10231,6 +10721,13 @@ def _transpile_unit(
             scalar_only = True
             scalar_parts: List[tuple[str, str]] = []
             for pit in items:
+                m_exact_sec_scalar = re.match(r"^\s*([a-z_]\w*)\s*\(\s*([^()]*)\s*\)\s*$", pit, re.IGNORECASE)
+                if m_exact_sec_scalar:
+                    an_scalar = m_exact_sec_scalar.group(1).lower()
+                    av_scalar = vars_map.get(an_scalar)
+                    if av_scalar is not None and av_scalar.is_array:
+                        scalar_only = False
+                        break
                 m_simple_arr = re.match(r"^([a-z_]\w*)$", pit, re.IGNORECASE)
                 if m_simple_arr:
                     vv = vars_map.get(m_simple_arr.group(1).lower())
@@ -10243,7 +10740,9 @@ def _transpile_unit(
             if scalar_only and scalar_parts:
                 out.append(" " * indent + "{")
                 out.append(" " * (indent + 3) + "int __first = 1;")
+                prev_string_like = False
                 for cty_p, cexpr_p in scalar_parts:
+                    sep_expr = '""' if prev_string_like and cty_p in {"string", "trim_string"} else '" "'
                     _emit_list_directed_scalar_printf(
                         out,
                         indent + 3,
@@ -10251,9 +10750,10 @@ def _transpile_unit(
                         cty_p,
                         vars_map,
                         real_type,
-                        prefix_expr='__first ? "" : " "',
+                        prefix_expr=f'__first ? "" : {sep_expr}',
                     )
                     out.append(" " * (indent + 3) + "__first = 0;")
+                    prev_string_like = cty_p in {"string", "trim_string"}
                 out.append(" " * (indent + 3) + 'printf("\\n");')
                 out.append(" " * indent + "}")
                 continue
@@ -10478,9 +10978,9 @@ def _transpile_unit(
                     if loc_mixed_saw and loc_mixed_supported and loc_mixed_parts:
                         out.append(" " * indent + "{")
                         out.append(" " * (indent + 3) + "int __first = 1;")
-                        all_string_like = all(cty_p in {"string", "trim_string"} for cty_p, _ in loc_mixed_parts)
-                        sep_expr = '""' if all_string_like else '" "'
+                        prev_string_like = False
                         for cty_p, cexpr_p in loc_mixed_parts:
+                            sep_expr = '""' if prev_string_like and cty_p in {"string", "trim_string"} else '" "'
                             _emit_list_directed_scalar_printf(
                                 out,
                                 indent + 3,
@@ -10491,12 +10991,20 @@ def _transpile_unit(
                                 prefix_expr=f'__first ? "" : {sep_expr}',
                             )
                             out.append(" " * (indent + 3) + "__first = 0;")
+                            prev_string_like = cty_p in {"string", "trim_string"}
                         out.append(" " * (indent + 3) + 'printf("\\n");')
                         out.append(" " * indent + "}")
                         continue
                     mixed_parts: List[tuple[str, str]] = []
                     mixed_supported = True
                     for pit in items:
+                        m_sec_guard = re.match(r"^\s*([a-z_]\w*)\s*\(\s*([^()]*)\s*\)\s*$", pit, re.IGNORECASE)
+                        if m_sec_guard:
+                            vv_guard = vars_map.get(m_sec_guard.group(1).lower())
+                            idx_guard = _split_args_top_level(m_sec_guard.group(2))
+                            if vv_guard is not None and vv_guard.is_array and sum(':' in p for p in idx_guard) == 1 and len(idx_guard) == len(_resolved_dim_parts(vv_guard, m_sec_guard.group(1).lower(), assumed_extents)):
+                                mixed_supported = False
+                                break
                         if _is_fortran_string_literal(pit.strip()):
                             lit = _unquote_fortran_string_literal(pit.strip()).replace("\\", "\\\\").replace('"', '\\"')
                             mixed_parts.append(("string", f'"{lit}"'))
@@ -10555,9 +11063,9 @@ def _transpile_unit(
                     if mixed_supported and mixed_parts:
                         out.append(" " * indent + "{")
                         out.append(" " * (indent + 3) + "int __first = 1;")
-                        all_string_like = all(cty_p in {"string", "trim_string"} for cty_p, _ in mixed_parts)
-                        sep_expr = '""' if all_string_like else '" "'
+                        prev_string_like = False
                         for cty_p, cexpr_p in mixed_parts:
+                            sep_expr = '""' if prev_string_like and cty_p in {"string", "trim_string"} else '" "'
                             _emit_list_directed_scalar_printf(
                                 out,
                                 indent + 3,
@@ -10568,6 +11076,7 @@ def _transpile_unit(
                                 prefix_expr=f'__first ? "" : {sep_expr}',
                             )
                             out.append(" " * (indent + 3) + "__first = 0;")
+                            prev_string_like = cty_p in {"string", "trim_string"}
                         out.append(" " * (indent + 3) + 'printf("\\n");')
                         out.append(" " * indent + "}")
                         continue
@@ -11930,7 +12439,7 @@ def _transpile_unit(
                         continue
                     idx_parts_mix = _split_args_top_level(m_exact_sec_mix.group(2))
                     dparts_mix = _resolved_dim_parts(av_mix, an_mix, assumed_extents)
-                    if not (len(dparts_mix) == 1 and len(idx_parts_mix) == 1 and ":" in idx_parts_mix[0]):
+                    if not (len(dparts_mix) == len(idx_parts_mix) and sum(':' in p for p in idx_parts_mix) == 1):
                         section_mixed_possible = False
                         break
                     has_section_mixed = True
@@ -11965,12 +12474,26 @@ def _transpile_unit(
                         av_mix = vars_map.get(an_mix)
                         dparts_mix = _resolved_dim_parts(av_mix, an_mix, assumed_extents) if av_mix is not None else []
                         idx_parts_mix = _split_args_top_level(m_exact_sec_mix.group(2))
-                        sp_mix = _split_colon_top_level(idx_parts_mix[0].strip())
+                        sec_dim = next((k for k, p in enumerate(idx_parts_mix) if ":" in p), -1)
+                        sp_mix = _split_colon_top_level(idx_parts_mix[sec_dim].strip())
                         lo_mix = _convert_expr((sp_mix[0] or "1").strip(), vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
-                        hi_mix = _convert_expr((sp_mix[1] or dparts_mix[0]).strip(), vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                        hi_mix = _convert_expr((sp_mix[1] or dparts_mix[sec_dim]).strip(), vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                         st_mix = _convert_expr((sp_mix[2] if len(sp_mix) == 3 else "1").strip(), vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                         npr_mix = _section_count_expr(lo_mix, hi_mix, st_mix)
-                        cit_mix = f"{an_mix}[(({lo_mix}) + i_pr * ({st_mix})) - 1]"
+                        idx_vals_mix: List[str] = []
+                        for k, p in enumerate(idx_parts_mix):
+                            if k == sec_dim:
+                                idx_vals_mix.append(f"(({lo_mix}) + i_pr * ({st_mix}))")
+                            else:
+                                idx_vals_mix.append(_convert_expr(p.strip(), vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names))
+                        lin_mix = f"(({idx_vals_mix[0]}) - 1)"
+                        if len(idx_vals_mix) >= 2:
+                            lin_mix = f"{lin_mix} + ({_convert_expr(dparts_mix[0], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)}) * (({idx_vals_mix[1]}) - 1)"
+                        if len(idx_vals_mix) >= 3:
+                            dim0_mix = _convert_expr(dparts_mix[0], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                            dim1_mix = _convert_expr(dparts_mix[1], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                            lin_mix = f"{lin_mix} + ({dim0_mix}) * ({dim1_mix}) * (({idx_vals_mix[2]}) - 1)"
+                        cit_mix = f"{an_mix}[{lin_mix}]"
                         cty_mix = _format_item_ctype(pit, vars_map, real_type)
                         out.append(" " * (indent + 3) + f"for (int i_pr = 0; i_pr < {npr_mix}; ++i_pr) {{")
                         _emit_list_directed_scalar_printf(
@@ -12075,12 +12598,13 @@ def _transpile_unit(
             if mixed_supported and mixed_parts:
                 out.append(" " * indent + "{")
                 out.append(" " * (indent + 3) + "int __first = 1;")
-                all_string_like = all(cty_p in {"string", "trim_string"} for cty_p, _ in mixed_parts)
-                sep_expr = '""' if all_string_like else '" "'
+                prev_string_like = False
                 for cty_p, cexpr_p in mixed_parts:
+                    sep_expr = '""' if prev_string_like and cty_p in {"string", "trim_string"} else '" "'
                     if cty_p == "dtio_write":
                         if _emit_defined_output_call(cexpr_p, prefix_expr=f'__first ? "" : {sep_expr}', newline=False):
                             out.append(" " * (indent + 3) + "__first = 0;")
+                            prev_string_like = False
                             continue
                     _emit_list_directed_scalar_printf(
                         out,
@@ -12092,6 +12616,7 @@ def _transpile_unit(
                         prefix_expr=f'__first ? "" : {sep_expr}',
                     )
                     out.append(" " * (indent + 3) + "__first = 0;")
+                    prev_string_like = cty_p in {"string", "trim_string"}
                 out.append(" " * (indent + 3) + 'printf("\\n");')
                 out.append(" " * indent + "}")
                 continue
@@ -12743,6 +13268,7 @@ def _transpile_unit(
                 fmts: List[str] = []
                 cargs: List[str] = []
                 ctypes_ld: List[str] = []
+                simple_scalar_items = True
                 for it in items:
                     if (it.startswith('"') and it.endswith('"')) or (it.startswith("'") and it.endswith("'")):
                         content = it[1:-1].replace('\\', '\\\\').replace('"', '\\"')
@@ -12750,18 +13276,136 @@ def _transpile_unit(
                         ctypes_ld.append('string')
                         fmts.append(_list_directed_scalar_fmt('string'))
                         continue
+                    m_simple_arr = re.match(r"^([a-z_]\w*)$", it, re.IGNORECASE)
+                    if m_simple_arr:
+                        vv_simple = vars_map.get(m_simple_arr.group(1).lower())
+                        if vv_simple is not None and vv_simple.is_array:
+                            simple_scalar_items = False
+                            break
+                    toks_it = {t.lower() for t in re.findall(r"\b[a-z_]\w*\b", _strip_comment(it), flags=re.IGNORECASE)}
+                    if any((vars_map.get(t) is not None and vars_map[t].is_array) for t in toks_it):
+                        simple_scalar_items = False
+                        break
                     cit = _convert_expr(it, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                     cargs.append(cit)
                     cty = _format_item_ctype(it, vars_map, real_type)
                     ctypes_ld.append(cty)
                     fmts.append(_list_directed_scalar_fmt(cty))
-                trail = '    ' if _list_directed_has_trailing_real(ctypes_ld) else ''
-                prefix = ' ' if ctypes_ld and all((ct or '').lower() == 'string' for ct in ctypes_ld) else ''
-                out.append(" " * indent + f'printf("{prefix}{"".join(fmts)}{trail}\\n", {", ".join(cargs)});')
-                continue
+                if simple_scalar_items:
+                    trail = '    ' if _list_directed_has_trailing_real(ctypes_ld) else ''
+                    prefix = ' ' if ctypes_ld and all((ct or '').lower() == 'string' for ct in ctypes_ld) else ''
+                    out.append(" " * indent + f'printf("{prefix}{"".join(fmts)}{trail}\\n", {", ".join(cargs)});')
+                    continue
+            if len(items) >= 2:
+                prefix_parts_ls: List[tuple[str, str]] = []
+                prefix_ok_ls = True
+                for pit in items[:-1]:
+                    if _is_fortran_string_literal(pit.strip()):
+                        lit = _unquote_fortran_string_literal(pit.strip()).replace("\\", "\\\\").replace('"', '\\"')
+                        prefix_parts_ls.append(("string", f'"{lit}"'))
+                        continue
+                    m_trim = re.match(r"^\s*trim\s*\(\s*([a-z_]\w*)\s*\)\s*$", pit, re.IGNORECASE)
+                    if m_trim:
+                        prefix_parts_ls.append(("trim_string", m_trim.group(1).lower()))
+                        continue
+                    toks_p = {t.lower() for t in re.findall(r"\b[a-z_]\w*\b", _strip_comment(pit), flags=re.IGNORECASE)}
+                    if any((vars_map.get(t) is not None and vars_map[t].is_array) for t in toks_p):
+                        prefix_ok_ls = False
+                        break
+                    prefix_parts_ls.append((
+                        _format_item_ctype(pit, vars_map, real_type),
+                        _convert_expr(pit, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names),
+                    ))
+                m_sec_last = _match_whole_name_call(items[-1]) if prefix_ok_ls else None
+                if m_sec_last:
+                    an = m_sec_last[0].lower()
+                    av = vars_map.get(an)
+                    if av is not None and av.is_array:
+                        idx_parts = _split_args_top_level(m_sec_last[1])
+                        dparts = _resolved_dim_parts(av, an, assumed_extents)
+                        rank = len(dparts)
+                        cty = (av.ctype or real_type).lower()
+                        efmt = "%d" if cty == "int" else "%g"
+                        if rank in {2, 3} and len(idx_parts) == rank:
+                            dimc = [
+                                _convert_expr(dparts[k], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                                for k in range(rank)
+                            ]
+
+                            def _parse_dim_spec_mix(txt: str, dflt_hi: str) -> dict:
+                                t = txt.strip()
+                                if ":" in t:
+                                    sp = _split_colon_top_level(t)
+                                    lo = _convert_expr((sp[0] or "1").strip(), vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                                    hi = _convert_expr((sp[1] or dflt_hi).strip(), vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                                    st = _convert_expr((sp[2] if len(sp) == 3 else "1").strip(), vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                                    return {"kind": "sec", "lo": lo, "hi": hi, "st": st}
+                                val = _convert_expr(t, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                                return {"kind": "scalar", "val": val}
+
+                            specs = [_parse_dim_spec_mix(idx_parts[k], dimc[k]) for k in range(rank)]
+                            if any(sp["kind"] != "scalar" for sp in specs):
+                                out.append(" " * indent + "{")
+                                out.append(" " * (indent + 3) + "int __first = 1;")
+                                for cty_p, cexpr_p in prefix_parts_ls:
+                                    _emit_list_directed_scalar_printf(
+                                        out,
+                                        indent + 3,
+                                        cexpr_p,
+                                        cty_p,
+                                        vars_map,
+                                        real_type,
+                                        prefix_expr='__first ? "" : " "',
+                                    )
+                                    out.append(" " * (indent + 3) + "__first = 0;")
+                                idx_map: Dict[int, str] = {}
+
+                                def _lin_expr_mix() -> str:
+                                    i1 = idx_map.get(1, "1")
+                                    lin = f"(({i1}) - 1)"
+                                    if rank >= 2:
+                                        i2 = idx_map.get(2, "1")
+                                        lin = f"{lin} + ({dimc[0]}) * (({i2}) - 1)"
+                                    if rank >= 3:
+                                        i3 = idx_map.get(3, "1")
+                                        lin = f"{lin} + ({dimc[0]}) * ({dimc[1]}) * (({i3}) - 1)"
+                                    return lin
+
+                                def _emit_dim_mix(dim_k: int, ind: int) -> None:
+                                    if dim_k < 1:
+                                        lin = _lin_expr_mix()
+                                        out.append(" " * ind + f'printf("%s{efmt}", __first ? "" : " ", {an}[{lin}]);')
+                                        out.append(" " * ind + "__first = 0;")
+                                        return
+                                    sp = specs[dim_k - 1]
+                                    if sp["kind"] == "scalar":
+                                        idx_map[dim_k] = sp["val"]
+                                        _emit_dim_mix(dim_k - 1, ind)
+                                        return
+                                    vnm = f"__i{dim_k}"
+                                    idx_map[dim_k] = vnm
+                                    out.append(" " * ind + f"for (int {vnm} = {sp['lo']}; ({sp['st']}) > 0 ? {vnm} <= {sp['hi']} : {vnm} >= {sp['hi']}; {vnm} += {sp['st']}) {{")
+                                    _emit_dim_mix(dim_k - 1, ind + 3)
+                                    out.append(" " * ind + "}")
+
+                                _emit_dim_mix(rank, indent + 3)
+                                out.append(" " * (indent + 3) + 'printf("\\n");')
+                                out.append(" " * indent + "}")
+                                continue
+            section_positions: List[int] = []
             mixed_parts: List[tuple[str, str]] = []
             mixed_supported = True
-            for pit in items:
+            for pit_idx, pit in enumerate(items):
+                m_sec_mix = _match_whole_name_call(pit.strip())
+                if m_sec_mix:
+                    an_mix = m_sec_mix[0].lower()
+                    av_mix = vars_map.get(an_mix)
+                    if av_mix is not None and av_mix.is_array:
+                        idx_parts_mix = _split_args_top_level(m_sec_mix[1])
+                        if any(":" in p for p in idx_parts_mix):
+                            section_positions.append(pit_idx)
+                            mixed_parts.append(("array_section", pit.strip()))
+                            continue
                 if _is_fortran_string_literal(pit.strip()):
                     lit = _unquote_fortran_string_literal(pit.strip()).replace("\\", "\\\\").replace('"', '\\"')
                     mixed_parts.append(("string", f'"{lit}"'))
@@ -12813,10 +13457,106 @@ def _transpile_unit(
                 cty_p = _format_item_ctype(pit, vars_map, real_type)
                 cexpr_p = _convert_expr(pit, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                 mixed_parts.append((cty_p, cexpr_p))
+            if mixed_supported and len(section_positions) == 1:
+                sec_pos = section_positions[0]
+                sec_text = mixed_parts[sec_pos][1]
+                m_sec_last = _match_whole_name_call(sec_text)
+                if m_sec_last:
+                    an = m_sec_last[0].lower()
+                    av = vars_map.get(an)
+                    if av is not None and av.is_array:
+                        idx_parts = _split_args_top_level(m_sec_last[1])
+                        dparts = _resolved_dim_parts(av, an, assumed_extents)
+                        rank = len(dparts)
+                        cty = (av.ctype or real_type).lower()
+                        efmt = "%d" if cty == "int" else "%g"
+                        if rank in {2, 3} and len(idx_parts) == rank:
+                            dimc = [
+                                _convert_expr(dparts[k], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                                for k in range(rank)
+                            ]
+
+                            def _parse_dim_spec_mix2(txt: str, dflt_hi: str) -> dict:
+                                t = txt.strip()
+                                if ":" in t:
+                                    sp = _split_colon_top_level(t)
+                                    lo = _convert_expr((sp[0] or "1").strip(), vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                                    hi = _convert_expr((sp[1] or dflt_hi).strip(), vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                                    st = _convert_expr((sp[2] if len(sp) == 3 else "1").strip(), vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                                    return {"kind": "sec", "lo": lo, "hi": hi, "st": st}
+                                val = _convert_expr(t, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                                return {"kind": "scalar", "val": val}
+
+                            specs = [_parse_dim_spec_mix2(idx_parts[k], dimc[k]) for k in range(rank)]
+                            if any(sp["kind"] != "scalar" for sp in specs):
+                                out.append(" " * indent + "{")
+                                out.append(" " * (indent + 3) + "int __first = 1;")
+
+                                def _emit_scalar_mixed_part(ind: int, part: tuple[str, str]) -> None:
+                                    cty_p, cexpr_p = part
+                                    _emit_list_directed_scalar_printf(
+                                        out,
+                                        ind,
+                                        cexpr_p,
+                                        cty_p,
+                                        vars_map,
+                                        real_type,
+                                        prefix_expr='__first ? "" : " "',
+                                    )
+                                    out.append(" " * ind + "__first = 0;")
+
+                                for part in mixed_parts[:sec_pos]:
+                                    if part[0] == "array_section":
+                                        mixed_supported = False
+                                        break
+                                    _emit_scalar_mixed_part(indent + 3, part)
+                                if mixed_supported:
+                                    idx_map: Dict[int, str] = {}
+
+                                    def _lin_expr_mix2() -> str:
+                                        i1 = idx_map.get(1, "1")
+                                        lin = f"(({i1}) - 1)"
+                                        if rank >= 2:
+                                            i2 = idx_map.get(2, "1")
+                                            lin = f"{lin} + ({dimc[0]}) * (({i2}) - 1)"
+                                        if rank >= 3:
+                                            i3 = idx_map.get(3, "1")
+                                            lin = f"{lin} + ({dimc[0]}) * ({dimc[1]}) * (({i3}) - 1)"
+                                        return lin
+
+                                    def _emit_dim_mix2(dim_k: int, ind: int) -> None:
+                                        if dim_k < 1:
+                                            lin = _lin_expr_mix2()
+                                            out.append(" " * ind + f'printf("%s{efmt}", __first ? "" : " ", {an}[{lin}]);')
+                                            out.append(" " * ind + "__first = 0;")
+                                            return
+                                        sp = specs[dim_k - 1]
+                                        if sp["kind"] == "scalar":
+                                            idx_map[dim_k] = sp["val"]
+                                            _emit_dim_mix2(dim_k - 1, ind)
+                                            return
+                                        vnm = f"__i{dim_k}"
+                                        idx_map[dim_k] = vnm
+                                        out.append(" " * ind + f"for (int {vnm} = {sp['lo']}; ({sp['st']}) > 0 ? {vnm} <= {sp['hi']} : {vnm} >= {sp['hi']}; {vnm} += {sp['st']}) {{")
+                                        _emit_dim_mix2(dim_k - 1, ind + 3)
+                                        out.append(" " * ind + "}")
+
+                                    _emit_dim_mix2(rank, indent + 3)
+                                    for part in mixed_parts[sec_pos + 1 :]:
+                                        if part[0] == "array_section":
+                                            mixed_supported = False
+                                            break
+                                        _emit_scalar_mixed_part(indent + 3, part)
+                                out.append(" " * (indent + 3) + 'printf("\\n");')
+                                out.append(" " * indent + "}")
+                                if mixed_supported:
+                                    continue
             if mixed_supported and mixed_parts:
                 out.append(" " * indent + "{")
                 out.append(" " * (indent + 3) + "int __first = 1;")
+                prev_string_like = False
                 for cty_p, cexpr_p in mixed_parts:
+                    sep_expr = '""' if prev_string_like and cty_p in {"string", "trim_string"} else '" "'
                     _emit_list_directed_scalar_printf(
                         out,
                         indent + 3,
@@ -12824,9 +13564,10 @@ def _transpile_unit(
                         cty_p,
                         vars_map,
                         real_type,
-                        prefix_expr='__first ? "" : " "',
+                        prefix_expr=f'__first ? "" : {sep_expr}',
                     )
                     out.append(" " * (indent + 3) + "__first = 0;")
+                    prev_string_like = cty_p in {"string", "trim_string"}
                 out.append(" " * (indent + 3) + 'printf("\\n");')
                 out.append(" " * indent + "}")
                 continue
@@ -14209,17 +14950,21 @@ def _transpile_unit(
             if m_lhs_sub:
                 lhs_nm = m_lhs_sub.group(1).lower()
                 lv = vars_map.get(lhs_nm)
-                if lv is not None and (lv.ctype or '').lower() == 'char *' and (not lv.is_array) and lv.char_len:
+                if lv is not None and (lv.ctype or '').lower() == 'char *' and (not lv.is_array):
                     lo = _convert_expr(m_lhs_sub.group(2).strip(), vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                    if lv.char_len and str(lv.char_len).strip() != ":":
+                        len_expr = _convert_expr(lv.char_len, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                    else:
+                        len_expr = f"((int) strlen({lhs_nm}))"
                     hi_raw = m_lhs_sub.group(3).strip()
-                    hi = _convert_expr(hi_raw, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names) if hi_raw else _convert_expr(lv.char_len, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                    hi = _convert_expr(hi_raw, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names) if hi_raw else len_expr
                     m_rhs_any_call = re.match(r"^\s*([a-z_]\w*)\s*\((.*)\)\s*$", rhs_raw, re.IGNORECASE)
                     if m_rhs_any_call and any(proc_arg_optional.get(m_rhs_any_call.group(1).lower(), [])):
                         args_rhs = _split_args_top_level(m_rhs_any_call.group(2).strip()) if m_rhs_any_call.group(2).strip() else []
                         rhs = _convert_optional_call_expr(m_rhs_any_call.group(1), args_rhs)
                     else:
                         rhs = _convert_expr(rhs_raw, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
-                    out.append(" " * indent + f"assign_substr({lhs_nm}, {_convert_expr(lv.char_len, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)}, {lo}, {hi}, {rhs});")
+                    out.append(" " * indent + f"assign_substr({lhs_nm}, {len_expr}, {lo}, {hi}, {rhs});")
                     continue
             scalar_sum = _extract_scalar_sum(rhs_raw)
             if scalar_sum is not None:
@@ -14389,10 +15134,10 @@ def _transpile_unit(
 
 
 
-def _extract_module_parameter_maps(
+def _extract_module_decl_maps(
     text: str, real_type: str, kind_ctype_map: Dict[str, str]
 ) -> tuple[Dict[str, Dict[str, Var]], Dict[str, str]]:
-    """Collect module-scope PARAMETER declarations and contained-procedure parents."""
+    """Collect module-scope declarations and contained-procedure parents."""
     lines = text.splitlines()
     module_decl_lines: Dict[str, List[str]] = {}
     proc_parent_module: Dict[str, str] = {}
@@ -14428,28 +15173,28 @@ def _extract_module_parameter_maps(
         )
         if m_proc:
             proc_parent_module[m_proc.group(2).lower()] = current_module
-    module_param_maps: Dict[str, Dict[str, Var]] = {}
+    module_decl_maps: Dict[str, Dict[str, Var]] = {}
     for mod_name, decl_lines in module_decl_lines.items():
         pseudo = {"body_lines": decl_lines, "body_line_nos": [], "source_lines": []}
         parsed = _parse_decls(pseudo, real_type, kind_ctype_map)
-        module_param_maps[mod_name] = {nm: v for nm, v in parsed.items() if v.is_param}
-    return module_param_maps, proc_parent_module
+        module_decl_maps[mod_name] = parsed
+    return module_decl_maps, proc_parent_module
 
 
-def _imported_module_parameters_for_unit(
+def _imported_module_decls_for_unit(
     unit: Dict[str, object],
     units: List[Dict[str, object]],
-    module_param_maps: Dict[str, Dict[str, Var]],
+    module_decl_maps: Dict[str, Dict[str, Var]],
     proc_parent_module: Dict[str, str],
     real_type: str,
     kind_ctype_map: Dict[str, str],
 ) -> Dict[str, Var]:
-    """Return PARAMETERs visible in a unit via host association or USE."""
+    """Return module declarations visible in a unit via host association or USE."""
     imported: Dict[str, Var] = {}
     unit_name = str(unit.get("name", "")).lower()
     parent_mod = proc_parent_module.get(unit_name)
-    if parent_mod and parent_mod in module_param_maps:
-        imported.update(dict(module_param_maps[parent_mod]))
+    if parent_mod and parent_mod in module_decl_maps:
+        imported.update(dict(module_decl_maps[parent_mod]))
     header_line = int(unit.get("header_line_no", 0))
     host_unit: Optional[Dict[str, object]] = None
     for cand in units:
@@ -14484,12 +15229,12 @@ def _imported_module_parameters_for_unit(
         if not m_use:
             continue
         mod_name = m_use.group(1).lower()
-        params = module_param_maps.get(mod_name)
-        if not params:
+        decls = module_decl_maps.get(mod_name)
+        if not decls:
             continue
         only_list = (m_use.group(2) or "").strip()
         if not only_list:
-            imported.update(dict(params))
+            imported.update(dict(decls))
             continue
         for item in _split_args_top_level(only_list):
             it = item.strip()
@@ -14499,12 +15244,12 @@ def _imported_module_parameters_for_unit(
             if m_rename:
                 local_name = m_rename.group(1).lower()
                 use_name = m_rename.group(2).lower()
-                if use_name in params:
-                    imported[local_name] = params[use_name]
+                if use_name in decls:
+                    imported[local_name] = decls[use_name]
                 continue
             nm = it.lower()
-            if nm in params:
-                imported[nm] = params[nm]
+            if nm in decls:
+                imported[nm] = decls[nm]
     return imported
 
 
@@ -14644,6 +15389,184 @@ def _local_interface_proc_signatures(
         current["body_lines"].append(code)
     return sigs
 
+
+def _split_code_comment_for_data(line: str) -> tuple[str, str]:
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "'" and not in_double:
+            if in_single and i + 1 < len(line) and line[i + 1] == "'":
+                i += 2
+                continue
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            if in_double and i + 1 < len(line) and line[i + 1] == '"':
+                i += 2
+                continue
+            in_double = not in_double
+            i += 1
+            continue
+        if ch == "!" and not in_single and not in_double:
+            return line[:i], line[i:]
+        i += 1
+    return line, ""
+
+
+def _parse_decl_line_for_data(raw: str) -> Optional[tuple[str, str, List[str], List[str], str]]:
+    code, comment = _split_code_comment_for_data(raw.rstrip("\r\n"))
+    if not code.strip():
+        return None
+    m = re.match(
+        r"^(\s*)(?P<prefix>(?:double\s+precision|integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|character(?:\s*\([^)]*\)|\*\s*[^,\s]+)?|type\s*\([^)]*\)|class\s*\([^)]*\))(?:\s*,\s*[^:]+?)*)\s*::\s*(?P<rhs>.+)$",
+        code,
+        re.IGNORECASE,
+    )
+    if not m:
+        m = re.match(
+            r"^(\s*)(?P<prefix>(?:double\s+precision|integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|character(?:\s*\([^)]*\)|\*\s*[^,\s]+)?|type\s*\([^)]*\)|class\s*\([^)]*\)))\s+(?P<rhs>.+)$",
+            code,
+            re.IGNORECASE,
+        )
+    if not m:
+        return None
+    rhs = m.group("rhs").strip()
+    entities = [x.strip() for x in _split_args_top_level(rhs) if x.strip()]
+    if not entities:
+        return None
+    names: List[str] = []
+    for ent in entities:
+        lhs = ent.split("=", 1)[0].strip()
+        m_name = re.match(r"^([a-z_]\w*)", lhs, re.IGNORECASE)
+        if not m_name:
+            return None
+        names.append(m_name.group(1).lower())
+    return m.group(1), m.group("prefix").strip(), entities, names, comment
+
+
+def _expand_data_constants(values_text: str) -> List[str]:
+    out: List[str] = []
+    for item in _split_args_top_level(values_text):
+        it = item.strip()
+        if not it:
+            continue
+        m_rep = re.match(r"^([0-9]+)\s*\*\s*(.+)$", it, re.IGNORECASE)
+        if m_rep:
+            count = int(m_rep.group(1))
+            value = m_rep.group(2).strip()
+            out.extend([value] * count)
+        else:
+            out.append(it)
+    return out
+
+
+def _rewrite_decl_entity_with_init(entity: str, init_expr: str) -> str:
+    lhs = entity.split("=", 1)[0].rstrip()
+    return f"{lhs} = {init_expr}"
+
+
+def _flatten_data_implied_do_values(lhs_text: str, values_text: str) -> Optional[tuple[str, str]]:
+    m = re.match(
+        r"^\(\s*([a-z_]\w*)\s*\(\s*([a-z_]\w*)\s*\)\s*,\s*([a-z_]\w*)\s*=\s*([^,]+)\s*,\s*([^,()]+)(?:\s*,\s*([^,()]+))?\s*\)$",
+        lhs_text.strip(),
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+    arr_name = m.group(1).lower()
+    sub_idx = m.group(2).lower()
+    iter_name = m.group(3).lower()
+    if sub_idx != iter_name:
+        return None
+    lo = _eval_int_expr(m.group(4).strip())
+    hi = _eval_int_expr(m.group(5).strip())
+    st = _eval_int_expr((m.group(6) or "1").strip())
+    if lo is None or hi is None or st is None or st == 0:
+        return None
+    n_vals = 0
+    if st > 0:
+        if lo > hi:
+            n_vals = 0
+        else:
+            n_vals = ((hi - lo) // st) + 1
+    else:
+        if lo < hi:
+            n_vals = 0
+        else:
+            n_vals = ((lo - hi) // (-st)) + 1
+    flat_vals = _expand_data_constants(values_text)
+    if n_vals != len(flat_vals):
+        return None
+    return arr_name, "[" + ", ".join(flat_vals) + "]"
+
+
+def _rewrite_data_statements(text: str) -> str:
+    lines = text.splitlines()
+    units = fscan.split_fortran_units_simple(text)
+    rewrites: Dict[int, Optional[str]] = {}
+    for unit in units:
+        decls_by_name: Dict[str, int] = {}
+        decl_state: Dict[int, tuple[str, str, List[str], List[str], str]] = {}
+        for line_no in unit.get("body_line_nos", []):
+            parsed = _parse_decl_line_for_data(lines[line_no - 1])
+            if parsed is None:
+                continue
+            indent, prefix, entities, names, comment = parsed
+            decl_state[line_no] = (indent, prefix, list(entities), list(names), comment)
+            for name in names:
+                decls_by_name[name] = line_no
+        for line_no in unit.get("body_line_nos", []):
+            stmt = _strip_comment(lines[line_no - 1]).strip()
+            m_data = re.match(r"^data\s+(.+?)\s*/\s*(.*?)\s*/\s*$", stmt, re.IGNORECASE)
+            if not m_data:
+                continue
+            lhs_text = m_data.group(1).strip()
+            values_text = m_data.group(2).strip()
+            data_target = _flatten_data_implied_do_values(lhs_text, values_text)
+            if data_target is not None:
+                target_name, init_expr = data_target
+            else:
+                m_name = re.match(r"^([a-z_]\w*)(?:\s*\(.*\))?\s*$", lhs_text, re.IGNORECASE)
+                if not m_name:
+                    continue
+                target_name = m_name.group(1).lower()
+                values = _expand_data_constants(values_text)
+                init_expr = values[0] if len(values) == 1 else "[" + ", ".join(values) + "]"
+            decl_line_no = decls_by_name.get(target_name)
+            if decl_line_no is None or decl_line_no not in decl_state:
+                continue
+            indent, prefix, entities, names, comment = decl_state[decl_line_no]
+            new_entities: List[str] = []
+            changed = False
+            for ent, name in zip(entities, names):
+                if name == target_name:
+                    new_entities.append(_rewrite_decl_entity_with_init(ent, init_expr))
+                    changed = True
+                else:
+                    new_entities.append(ent)
+            if not changed:
+                continue
+            decl_state[decl_line_no] = (indent, prefix, new_entities, names, comment)
+            rewrites[line_no] = ""
+        for decl_line_no, (indent, prefix, entities, _names, comment) in decl_state.items():
+            if decl_line_no in rewrites or any("=" in ent for ent in entities):
+                new_decl = f"{indent}{prefix} :: {', '.join(entities)}"
+                if comment:
+                    new_decl += comment
+                rewrites[decl_line_no] = new_decl
+    if not rewrites:
+        return text
+    out_lines: List[str] = []
+    for idx, raw in enumerate(lines, start=1):
+        if idx in rewrites:
+            out_lines.append(rewrites[idx] or "")
+        else:
+            out_lines.append(raw)
+    return "\n".join(out_lines) + ("\n" if text.endswith("\n") else "")
+
 def transpile_fortran_to_c(
     text: str,
     *,
@@ -14653,6 +15576,8 @@ def transpile_fortran_to_c(
     max_errors: int = 20,
 ) -> str:
     text = re.sub(r"(?i)intent\s*\(\s*in\s+out\s*\)", "intent(inout)", text)
+    text = _rewrite_data_statements(text)
+    text = _rewrite_simple_pdt_text(text)
     text, rewrite_line_map = _rewrite_simple_forall(text)
     text, rewrite_line_map_2 = _rewrite_inline_if_write(text)
     rewrite_line_map = _compose_line_maps(rewrite_line_map, rewrite_line_map_2)
@@ -14695,20 +15620,32 @@ def transpile_fortran_to_c(
         "#include <string.h>",
         "",
     ]
-    module_param_maps, proc_parent_module = _extract_module_parameter_maps(text, real_type, kind_ctype_map)
+    module_decl_maps, proc_parent_module = _extract_module_decl_maps(text, real_type, kind_ctype_map)
     decl_maps: List[Dict[str, Var]] = [_parse_decls(u, real_type, kind_ctype_map) for u in units]
+    emitted_module_globals: set[str] = set()
+    for decls in module_decl_maps.values():
+        for nm, vv in decls.items():
+            if vv.is_param or vv.is_external:
+                continue
+            if nm in emitted_module_globals:
+                continue
+            emitted_module_globals.add(nm)
+            vv_global = Var(**{**vv.__dict__, "is_module_var": True})
+            out.append(_emit_decl(nm, vv_global, decls, real_type, False))
+    if emitted_module_globals:
+        out.append("")
     for u, vmap in zip(units, decl_maps):
-        imported_params = _imported_module_parameters_for_unit(
+        imported_decls = _imported_module_decls_for_unit(
             u,
             units,
-            module_param_maps,
+            module_decl_maps,
             proc_parent_module,
             real_type,
             kind_ctype_map,
         )
-        for nm, vv in imported_params.items():
+        for nm, vv in imported_decls.items():
             if nm not in vmap:
-                vmap[nm] = vv
+                vmap[nm] = Var(**{**vv.__dict__, "is_module_var": (not vv.is_param)})
         iface_proc_kinds = _local_interface_proc_kinds(u)
         iface_proc_sigs = _local_interface_proc_signatures(u, real_type, kind_ctype_map)
         for a in u.get("args", []):
@@ -14796,7 +15733,7 @@ def transpile_fortran_to_c(
     array_result_funcs: set[str] = set()
     proc_results: Dict[str, Var] = {}
     global_param_exprs: Dict[str, str] = {}
-    for params in module_param_maps.values():
+    for params in module_decl_maps.values():
         for nm, vv in params.items():
             if vv.init is not None:
                 global_param_exprs.setdefault(nm.lower(), str(vv.init))

@@ -684,6 +684,8 @@ def find_implicit_none_undeclared_identifiers(
                 continue
             if low.startswith("close(") or low.startswith("close ("):
                 continue
+            if low.startswith("inquire(") or low.startswith("inquire ("):
+                continue
             if re.match(r"^if\s*\(.+\)\s*close\s*\(.*\)\s*$", low):
                 continue
             if "::" in code and declish_re.match(code):
@@ -830,7 +832,7 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
                 errs.append(f"line {lineno}: unexpected end program")
             continue
         m_fun = re.match(
-            r"^(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|double\s+precision)\s+)?function\s+[a-z_]\w*\s*\([^)]*\)\s*(?:result\s*\(\s*[a-z_]\w*\s*\))?\s*$",
+            r"^(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|double\s+precision)\s+)?function\s+[a-z_]\w*(?:\s*\([^)]*\))?\s*(?:result\s*\(\s*[a-z_]\w*\s*\))?\s*$",
             low,
         )
         if m_fun:
@@ -854,7 +856,7 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
                 errs.append(f"line {lineno}: unexpected end function")
             continue
         m_sub = re.match(
-            r"^(?:(?:pure|elemental|impure|recursive|module)\s+)*subroutine\s+([a-z_]\w*)\s*\([^)]*\)\s*$",
+            r"^(?:(?:pure|elemental|impure|recursive|module)\s+)*subroutine\s+([a-z_]\w*)(?:\s*\([^)]*\))?\s*$",
             low,
         )
         if m_sub:
@@ -968,6 +970,10 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
                 in_implicit_main = True
             continue
         if re.match(r"^backspace\s*\(.*\)\s*$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
+        if re.match(r"^inquire\s*\(.*\)\s*$", low):
             if not unit_stack:
                 in_implicit_main = True
             continue

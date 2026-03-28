@@ -241,6 +241,10 @@ int iachar_s(const char *s) {
 
 
 static FILE *unit_files[1000] = {0};
+static char unit_names[1000][4097] = {{0}};
+static char unit_access[1000][32] = {{0}};
+static char unit_form[1000][32] = {{0}};
+static char unit_action[1000][32] = {{0}};
 static const char *skip_space_s(const char *s);
 
 
@@ -263,15 +267,26 @@ int alloc_unit(void) {
 int open_unit(int unit, const char *file, const char *action, const char *status) {
    /* Open a file and bind it to a simple logical-unit table entry. */
    const char *mode = "r";
+   const char *action_meta = "READ";
+   const char *access_meta = "SEQUENTIAL";
+   const char *form_meta = "FORMATTED";
    if (action && strcmp(action, "write") == 0) mode = "w";
    else if (action && strcmp(action, "read") == 0) mode = "r";
    else if (action && strcmp(action, "readwrite") == 0) mode = "w+b";
    else if (status && strcmp(status, "replace") == 0) mode = "w";
+   if (action && strcmp(action, "write") == 0) action_meta = "WRITE";
+   else if (action && strcmp(action, "readwrite") == 0) action_meta = "READWRITE";
    FILE *fp = NULL;
    if ((!file || !*file) && status && strcmp(status, "scratch") == 0) fp = tmpfile();
    else fp = fopen(file, mode);
    if (!fp) return 1;
-   if (unit >= 0 && unit < 1000) unit_files[unit] = fp;
+   if (unit >= 0 && unit < 1000) {
+      unit_files[unit] = fp;
+      assign_str(unit_names[unit], 4096, file ? file : "");
+      assign_str(unit_access[unit], 31, access_meta);
+      assign_str(unit_form[unit], 31, form_meta);
+      assign_str(unit_action[unit], 31, action_meta);
+   }
    return 0;
 }
 
@@ -281,7 +296,54 @@ int close_unit(int unit) {
    FILE *fp = unit_get(unit);
    if (!fp) return 1;
    fclose(fp);
-   if (unit >= 0 && unit < 1000) unit_files[unit] = NULL;
+   if (unit >= 0 && unit < 1000) {
+      unit_files[unit] = NULL;
+      unit_names[unit][0] = '\0';
+      unit_access[unit][0] = '\0';
+      unit_form[unit][0] = '\0';
+      unit_action[unit][0] = '\0';
+   }
+   return 0;
+}
+
+
+int inquire_file_info(const char *file, int *exist_out, int *opened_out, char *name_out, int name_len) {
+   /* Inquire by file name for existence, opened status, and simple canonical name. */
+   const char *file_use = file ? file : "";
+   FILE *fp = NULL;
+   int opened = 0;
+   if (exist_out) *exist_out = 0;
+   if (opened_out) *opened_out = 0;
+   if (name_out && name_len >= 0) assign_str(name_out, name_len, "");
+   if (*file_use) {
+      fp = fopen(file_use, "rb");
+      if (fp) {
+         if (exist_out) *exist_out = 1;
+         fclose(fp);
+      }
+   }
+   for (int unit = 0; unit < 1000; ++unit) {
+      if (!unit_files[unit]) continue;
+      if (strcmp(trim_s(unit_names[unit]), trim_s(file_use)) == 0) {
+         opened = 1;
+         if (exist_out) *exist_out = 1;
+         break;
+      }
+   }
+   if (opened_out) *opened_out = opened;
+   if (name_out && name_len >= 0 && *file_use) assign_str(name_out, name_len, file_use);
+   return 0;
+}
+
+
+int inquire_unit_info(int unit, int *opened_out, char *name_out, int name_len, char *access_out, int access_len, char *form_out, int form_len, char *action_out, int action_len) {
+   /* Inquire by logical unit for opened status and stored metadata. */
+   int opened = (unit >= 0 && unit < 1000 && unit_files[unit] != NULL) ? 1 : 0;
+   if (opened_out) *opened_out = opened;
+   if (name_out && name_len >= 0) assign_str(name_out, name_len, opened ? unit_names[unit] : "");
+   if (access_out && access_len >= 0) assign_str(access_out, access_len, opened ? unit_access[unit] : "");
+   if (form_out && form_len >= 0) assign_str(form_out, form_len, opened ? unit_form[unit] : "");
+   if (action_out && action_len >= 0) assign_str(action_out, action_len, opened ? unit_action[unit] : "");
    return 0;
 }
 

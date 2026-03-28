@@ -23,6 +23,8 @@ int iachar_s(const char *s); /* Return the code of the first character, or zero 
 
 int open_unit(int unit, const char *file, const char *action, const char *status); /* Open a file and bind it to a simple logical-unit table entry. */
 int close_unit(int unit); /* Close the file currently associated with a logical unit number. */
+int inquire_file_info(const char *file, int *exist_out, int *opened_out, char *name_out, int name_len); /* Inquire by file name for existence, opened status, and canonical name. */
+int inquire_unit_info(int unit, int *opened_out, char *name_out, int name_len, char *access_out, int access_len, char *form_out, int form_len, char *action_out, int action_len); /* Inquire by logical unit for opened status and simple access/form/action metadata. */
 int rewind_unit(int unit); /* Reposition an open logical unit to the beginning of the file. */
 int backspace_unit(int unit); /* Reposition an open logical unit to the start of the previous record. */
 int alloc_unit(void); /* Pick the first unused logical unit number in a simple fixed table. */
