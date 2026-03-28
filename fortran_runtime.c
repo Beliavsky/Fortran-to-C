@@ -241,6 +241,7 @@ int iachar_s(const char *s) {
 
 
 static FILE *unit_files[1000] = {0};
+static const char *skip_space_s(const char *s);
 
 
 static FILE *unit_get(int unit) {
@@ -266,7 +267,9 @@ int open_unit(int unit, const char *file, const char *action, const char *status
    else if (action && strcmp(action, "read") == 0) mode = "r";
    else if (action && strcmp(action, "readwrite") == 0) mode = "w+b";
    else if (status && strcmp(status, "replace") == 0) mode = "w";
-   FILE *fp = fopen(file, mode);
+   FILE *fp = NULL;
+   if ((!file || !*file) && status && strcmp(status, "scratch") == 0) fp = tmpfile();
+   else fp = fopen(file, mode);
    if (!fp) return 1;
    if (unit >= 0 && unit < 1000) unit_files[unit] = fp;
    return 0;
@@ -356,6 +359,18 @@ void write_i0_then_words(int unit, int iv, int n, const char *const *words) {
       fprintf(fp, " %s", words[i] ? words[i] : "");
    }
    fputc('\n', fp);
+}
+
+
+int write_words_unit(int unit, int n, const char *const *words) {
+   /* Write n space-separated character items and a newline. */
+   FILE *fp = unit_get(unit);
+   if (!fp || (n > 0 && !words)) return 1;
+   for (int i = 0; i < n; ++i) {
+      if (i > 0) fputc(' ', fp);
+      if (fprintf(fp, "%s", words[i] ? words[i] : "") < 0) return 1;
+   }
+   return fputc('\n', fp) == EOF ? 1 : 0;
 }
 
 
@@ -463,6 +478,34 @@ int read_first_double_unit(int unit, double *out) {
    if (!fp || !out) return 1;
    if (!fgets(buf, (int) sizeof(buf), fp)) return 1;
    return read_first_double_s(buf, out);
+}
+
+
+int read_words_unit(int unit, int nw, char **words) {
+   /* Read one external list-directed record as nw whitespace-delimited words. */
+   char buf[8192];
+   FILE *fp = unit_get(unit);
+   const char *src;
+   if (!fp || nw < 0 || (nw > 0 && !words)) return 1;
+   if (!fgets(buf, (int) sizeof(buf), fp)) return 1;
+   src = skip_space_s(buf);
+   for (int i = 0; i < nw; ++i) {
+      const char *start;
+      size_t len;
+      src = skip_space_s(src);
+      if (!src || *src == '\0') return 1;
+      start = src;
+      while (*src != '\0' && !isspace((unsigned char) *src)) ++src;
+      len = (size_t) (src - start);
+      if (len == 0) return 1;
+      if (words[i]) free(words[i]);
+      words[i] = (char *) malloc(len + 1);
+      if (!words[i]) return 1;
+      memcpy(words[i], start, len);
+      words[i][len] = '\0';
+   }
+   src = skip_space_s(src);
+   return (src && *src == '\0') ? 0 : 1;
 }
 
 

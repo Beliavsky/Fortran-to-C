@@ -2046,6 +2046,81 @@ def _emit_basic_formatted_items_output(
                 proc_arg_extent_names,
             )
     if repeat_group is not None and len(items) >= 2:
+        tail_node = _parse_implied_do_item(items[-1])
+        prefix_data = sum(1 for tok in fixed_toks if tok.get('kind') == 'data')
+        if tail_node is not None and prefix_data == len(items) - 1 and all(_parse_implied_do_item(it) is None for it in items[:-1]):
+            def emit_fixed_prefix() -> None:
+                vi = 0
+                for tok in fixed_toks:
+                    kind = tok.get('kind')
+                    if kind == 'space':
+                        nsp = int(tok.get('count', 1))
+                        lit = (' ' * nsp).replace('\\', '\\\\').replace('"', '\\"')
+                        out.append(' ' * indent + f'printf("%s", "{lit}");')
+                    elif kind == 'newline':
+                        nlb = int(tok.get('count', 1))
+                        for _ in range(nlb):
+                            out.append(' ' * indent + 'printf("\\n");')
+                    elif kind == 'literal':
+                        lit = str(tok.get('text', '')).replace('\\', '\\\\').replace('"', '\\"')
+                        out.append(' ' * indent + f'printf("%s", "{lit}");')
+                    elif kind == 'data':
+                        cexpr = _convert_expr(items[vi], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                        ctype = _format_item_ctype(items[vi], vars_map, real_type)
+                        pf = _printf_fmt_for_basic_format_token(tok, ctype).replace('\\', '\\\\').replace('"', '\\"')
+                        out.append(' ' * indent + f'printf("{pf}", {cexpr});')
+                        vi += 1
+
+            def emit_repeat_scalar(expr: str, ind: int) -> None:
+                cexpr = _convert_expr(expr, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                ctype = _format_item_ctype(expr, vars_map, real_type)
+                for tok in repeat_group:
+                    kind = tok.get('kind')
+                    if kind == 'space':
+                        nsp = int(tok.get('count', 1))
+                        lit = (' ' * nsp).replace('\\', '\\\\').replace('"', '\\"')
+                        out.append(' ' * ind + f'printf("%s", "{lit}");')
+                    elif kind == 'newline':
+                        nlb = int(tok.get('count', 1))
+                        for _ in range(nlb):
+                            out.append(' ' * ind + 'printf("\\n");')
+                    elif kind == 'literal':
+                        lit = str(tok.get('text', '')).replace('\\', '\\\\').replace('"', '\\"')
+                        out.append(' ' * ind + f'printf("%s", "{lit}");')
+                    elif kind == 'data':
+                        pf = _printf_fmt_for_basic_format_token(tok, ctype).replace('\\', '\\\\').replace('"', '\\"')
+                        out.append(' ' * ind + f'printf("{pf}", {cexpr});')
+
+            def emit_repeat_node(n, ind: int) -> None:
+                if isinstance(n, str):
+                    emit_repeat_scalar(n, ind)
+                    return
+                var = str(n['var'])
+                clo = _convert_expr(str(n['lo']), vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                chi = _convert_expr(str(n['hi']), vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                step = n.get('step')
+                if step is None:
+                    out.append(' ' * ind + f'for ({var} = {clo}; {var} <= {chi}; ++{var}) {{')
+                    for child in n['body']:
+                        emit_repeat_node(child, ind + 3)
+                    out.append(' ' * ind + '}')
+                else:
+                    cstep = _convert_expr(str(step), vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                    out.append(' ' * ind + '{')
+                    out.append(' ' * (ind + 3) + f'int __step_{var} = {cstep};')
+                    out.append(' ' * (ind + 3) + f'for ({var} = {clo}; (__step_{var} >= 0) ? ({var} <= {chi}) : ({var} >= {chi}); {var} += __step_{var}) {{')
+                    for child in n['body']:
+                        emit_repeat_node(child, ind + 6)
+                    out.append(' ' * (ind + 3) + '}')
+                    out.append(' ' * ind + '}')
+
+            emit_fixed_prefix()
+            out.append(' ' * indent + '{')
+            emit_repeat_node(tail_node, indent + 3)
+            out.append(' ' * (indent + 3) + 'printf("\\n");')
+            out.append(' ' * indent + '}')
+            return True
+    if repeat_group is not None and len(items) >= 2:
         m_row = re.match(r'^([a-z_]\w*)\s*\(\s*([^,\)]*)\s*,\s*:\s*\)$', items[-1].strip(), re.IGNORECASE)
         if m_row:
             arr = m_row.group(1).lower()
@@ -3206,10 +3281,11 @@ def _array_constructor_items(init: Optional[str]) -> Optional[List[str]]:
     inner = m.group(1).strip()
     if not inner:
         return []
-    # Typed zero-size constructors such as [real ::], [integer ::], [type(t) ::]
+    # Typed constructors such as [character(len=5) :: "a", "b"].
     if "::" in inner:
-        lhs, rhs = inner.split("::", 1)
-        if rhs.strip() == "":
+        _lhs, rhs = inner.split("::", 1)
+        inner = rhs.strip()
+        if inner == "":
             return []
     return [x.strip() for x in _split_args_top_level(inner) if x.strip()]
 
@@ -3433,6 +3509,22 @@ def _rewrite_rank1_view_expr(
     assumed_extents: Optional[Dict[str, List[str]]],
     proc_arg_extent_names: Optional[Dict[str, List[List[str]]]],
 ) -> Optional[tuple[str, str, str]]:
+    def _is_string_like_expr_local(text: str) -> bool:
+        t = text.strip()
+        if _is_fortran_string_literal(t):
+            return True
+        if re.match(r"^(?:trim_s|adjustl_s|adjustr_s|substr_s|concat_s\d*)\s*\(", t, re.IGNORECASE):
+            return True
+        m_idx = re.match(r"^([a-z_]\w*)\s*\[[^\]]+\]$", t, re.IGNORECASE)
+        if m_idx:
+            vv = vars_map.get(m_idx.group(1).lower())
+            return vv is not None and (vv.ctype or "").lower() == "char *"
+        m_id = re.match(r"^([a-z_]\w*)$", t, re.IGNORECASE)
+        if m_id:
+            vv = vars_map.get(m_id.group(1).lower())
+            return vv is not None and (vv.ctype or "").lower() == "char *"
+        return False
+
     expr_rw = expr
     base_extent: Optional[str] = None
     base_ctype: Optional[str] = None
@@ -3488,6 +3580,16 @@ def _rewrite_rank1_view_expr(
         assumed_extents,
         proc_arg_extent_names,
     )
+    hit_cmp = _find_top_level_binary_operator(expr_rw, ["==", "/=", "!="])
+    if hit_cmp is not None:
+        pos_cmp, op_cmp = hit_cmp
+        lhs_cmp = expr_rw[:pos_cmp].strip()
+        rhs_cmp = expr_rw[pos_cmp + len(op_cmp):].strip()
+        if _is_string_like_expr_local(lhs_cmp) and _is_string_like_expr_local(rhs_cmp):
+            lhs_c = _convert_expr(lhs_cmp, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+            rhs_c = _convert_expr(rhs_cmp, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+            cmp_op = "==" if op_cmp == "==" else "!="
+            elem_c = f"(strcmp(trim_s({lhs_c}), trim_s({rhs_c})) {cmp_op} 0)"
     return elem_c, base_extent or "1", base_ctype or real_type
 
 
@@ -4926,6 +5028,9 @@ def _convert_expr(
     assumed_extents: Optional[Dict[str, List[str]]] = None,
     proc_arg_extent_names: Optional[Dict[str, List[List[str]]]] = None,
 ) -> str:
+    expr_s = expr.strip()
+    if _is_fortran_string_literal(expr_s):
+        return _replace_single_quoted_literals_outside_double(expr_s)
     def _inline_scalar_params_local(s: str) -> str:
         mapping: Dict[str, str] = {}
         for nm, vv in vars_map.items():
@@ -9021,6 +9126,19 @@ def _transpile_unit(
                 else:
                     out.append(" " * indent + f"if (open_unit({unit_c}, {file_c}, {action_c}, {status_c}) != 0) {fail_stmt}")
                 continue
+            if (unit_txt is not None or newunit_txt is not None) and file_txt is None and status_txt.strip().lower() in {'"scratch"', "'scratch'"}:
+                if newunit_txt is not None:
+                    unit_c = _convert_expr(newunit_txt, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                    out.append(" " * indent + f"{unit_c} = alloc_unit();")
+                else:
+                    unit_c = _convert_expr(unit_txt, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                action_c = _convert_expr(action_txt, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                status_c = _convert_expr(status_txt, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                if iostat_txt:
+                    out.append(" " * indent + f"{iostat_txt} = open_unit({unit_c}, NULL, {action_c}, {status_c});")
+                else:
+                    out.append(" " * indent + f"if (open_unit({unit_c}, NULL, {action_c}, {status_c}) != 0) {fail_stmt}")
+                continue
             out.append(" " * indent + f"/* unsupported: {code} */")
             continue
         parsed_close = _split_leading_paren_group(code, "close")
@@ -9185,6 +9303,24 @@ def _transpile_unit(
                 tgt_c = _convert_expr(tgt_raw, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                 tgt_cty = _format_item_ctype(tgt_raw, vars_map, real_type)
                 src_cty = _format_item_ctype(unit_txt, vars_map, real_type)
+                tv = vars_map.get(tgt_raw.lower())
+                if (
+                    src_cty != "char *"
+                    and tv is not None
+                    and tv.is_array
+                    and (tv.ctype or "").lower() == "char *"
+                    and (tv.is_allocatable or tv.is_pointer)
+                    and len(_resolved_dim_parts(tv, tgt_raw.lower(), assumed_extents)) == 1
+                ):
+                    if tv.is_allocatable or tv.is_pointer:
+                        n_words = _alloc_extent_names(tgt_raw.lower(), 1)[0]
+                    else:
+                        n_words = _dim_product_expr(tv.dim or "1", vars_map, real_type, byref_scalars, assumed_extents)
+                    if iostat_txt:
+                        out.append(" " * indent + f"{iostat_txt} = read_words_unit({src_c}, {n_words}, {tgt_c});")
+                    else:
+                        out.append(" " * indent + f"if (read_words_unit({src_c}, {n_words}, {tgt_c}) != 0) {fail_stmt}")
+                    continue
                 helper = None
                 if src_cty == "char *":
                     if tgt_cty == "int":
@@ -12057,6 +12193,31 @@ def _transpile_unit(
                         out.append(" " * (indent + 3) + f"write_i0_then_words({unit_c}, {first_c}, 0, NULL);")
                     out.append(" " * indent + "}")
                     continue
+                if fmt_clean == '(*(1x,a))' and unit_txt is not None and len(items_file) == 1:
+                    node_words = _parse_implied_do_item(items_file[0])
+                    unit_c = _convert_expr(unit_txt, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                    if node_words is not None and len(node_words.get("body", [])) == 1:
+                        body0 = node_words["body"][0]
+                        var0 = node_words["var"]
+                        lo0 = _convert_expr(node_words["lo"], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                        hi0 = _convert_expr(node_words["hi"], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                        st0 = _convert_expr(node_words.get("step") or "1", vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                        loop_byref = set(byref_scalars or set())
+                        loop_byref.discard(var0)
+                        body_c = _convert_expr(str(body0), vars_map, real_type, loop_byref, assumed_extents, proc_arg_extent_names)
+                        out.append(" " * indent + "{")
+                        out.append(" " * (indent + 3) + "int __nw = 0;")
+                        out.append(" " * (indent + 3) + f"for (int {var0} = {lo0}; ({st0}) > 0 ? {var0} <= {hi0} : {var0} >= {hi0}; {var0} += {st0}) ++__nw;")
+                        out.append(" " * (indent + 3) + "const char **__write_words = __nw > 0 ? (const char**) malloc(sizeof(char*) * __nw) : NULL;")
+                        out.append(" " * (indent + 3) + f"if (!__write_words && __nw > 0) {fail_stmt}")
+                        out.append(" " * (indent + 3) + "{")
+                        out.append(" " * (indent + 6) + "int __k = 0;")
+                        out.append(" " * (indent + 6) + f"for (int {var0} = {lo0}; ({st0}) > 0 ? {var0} <= {hi0} : {var0} >= {hi0}; {var0} += {st0}) __write_words[__k++] = {body_c};")
+                        out.append(" " * (indent + 3) + "}")
+                        out.append(" " * (indent + 3) + f"if (write_words_unit({unit_c}, __nw, __write_words) != 0) {fail_stmt}")
+                        out.append(" " * (indent + 3) + "if (__write_words) free(__write_words);")
+                        out.append(" " * indent + "}")
+                        continue
                 if fmt_clean == '(a)' and len(items_file) == 1 and unit_txt is not None:
                     unit_c = _convert_expr(unit_txt, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                     arg_c = _convert_expr(items_file[0], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
@@ -12160,6 +12321,39 @@ def _transpile_unit(
                     tail_fmt = tail[1:].strip() if tail.startswith(",") else tail
                     items_fmt = [x.strip() for x in _split_args_top_level(tail_fmt) if x.strip()]
                     fmt_clean = _unquote_fortran_string_literal(fmt_txt).strip().lower()
+                    m_lit_words = re.fullmatch(r"\('([^']*)',\*\(1x,a\)\)", fmt_clean)
+                    if m_lit_words and len(items_fmt) == 1:
+                        node_fmt = _parse_implied_do_item(items_fmt[0])
+                        if node_fmt is not None and len(node_fmt.get("body", [])) == 1:
+                            body0 = node_fmt["body"][0]
+                            var0 = node_fmt["var"]
+                            lo0 = _convert_expr(node_fmt["lo"], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                            hi0 = _convert_expr(node_fmt["hi"], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                            st0 = _convert_expr(node_fmt.get("step") or "1", vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                            loop_byref = set(byref_scalars or set())
+                            loop_byref.discard(var0)
+                            body_c = _convert_expr(str(body0), vars_map, real_type, loop_byref, assumed_extents, proc_arg_extent_names)
+                            lit_txt = m_lit_words.group(1).replace("\\", "\\\\").replace('"', '\\"')
+                            out.append(" " * indent + f'printf("%s", "{lit_txt}");')
+                            out.append(" " * indent + f"for (int {var0} = {lo0}; ({st0}) > 0 ? {var0} <= {hi0} : {var0} >= {hi0}; {var0} += {st0}) printf(\" %s\", {body_c});")
+                            out.append(" " * indent + 'printf("\\n");')
+                            continue
+                    if fmt_clean == '(a,100(1x,a))' and len(items_fmt) == 2:
+                        prefix_c = _convert_expr(items_fmt[0], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                        node_fmt = _parse_implied_do_item(items_fmt[1])
+                        if node_fmt is not None and len(node_fmt.get("body", [])) == 1:
+                            body0 = node_fmt["body"][0]
+                            var0 = node_fmt["var"]
+                            lo0 = _convert_expr(node_fmt["lo"], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                            hi0 = _convert_expr(node_fmt["hi"], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                            st0 = _convert_expr(node_fmt.get("step") or "1", vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                            loop_byref = set(byref_scalars or set())
+                            loop_byref.discard(var0)
+                            body_c = _convert_expr(str(body0), vars_map, real_type, loop_byref, assumed_extents, proc_arg_extent_names)
+                            out.append(" " * indent + f'printf("%s", {prefix_c});')
+                            out.append(" " * indent + f"for (int {var0} = {lo0}; ({st0}) > 0 ? {var0} <= {hi0} : {var0} >= {hi0}; {var0} += {st0}) printf(\" %s\", {body_c});")
+                            out.append(" " * indent + 'printf("\\n");')
+                            continue
                     if fmt_clean == '(i4.4,"-",i2.2)' and len(items_fmt) == 2:
                         c0 = _convert_expr(items_fmt[0], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                         c1 = _convert_expr(items_fmt[1], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
@@ -12738,18 +12932,29 @@ def _transpile_unit(
                 lhs_nm_ctor = m_lhs_whole_ctor.group(1).lower()
                 lv_ctor = vars_map.get(lhs_nm_ctor)
                 if lv_ctor is not None and lv_ctor.is_array:
-                    ctor_inner = m_rhs_ctor.group(1).strip()
-                    ctor_items = _split_args_top_level(ctor_inner) if ctor_inner else []
+                    ctor_items = _array_constructor_items(rhs_raw) or []
                     n_ctor = len([x for x in ctor_items if x.strip()])
                     if lv_ctor.is_allocatable:
-                        out.append(" " * indent + f"if ({lhs_nm_ctor}) free({lhs_nm_ctor});")
-                        out.append(" " * indent + f"{lhs_nm_ctor} = ({lv_ctor.ctype}*) malloc(sizeof({lv_ctor.ctype}) * {n_ctor});")
-                        out.append(" " * indent + f"if (!{lhs_nm_ctor} && {n_ctor} > 0) {fail_stmt}")
+                        if (lv_ctor.ctype or "").lower() == "char *":
+                            out.append(" " * indent + f"if ({lhs_nm_ctor}) free_str_array({lhs_nm_ctor}, {_alloc_len_name(lhs_nm_ctor)});")
+                            out.append(" " * indent + f"{lhs_nm_ctor} = (char**) malloc(sizeof(char*) * {n_ctor});")
+                            out.append(" " * indent + f"if (!{lhs_nm_ctor} && {n_ctor} > 0) {fail_stmt}")
+                            out.append(" " * indent + f"for (int i_fill = 0; i_fill < {n_ctor}; ++i_fill) {lhs_nm_ctor}[i_fill] = NULL;")
+                        else:
+                            out.append(" " * indent + f"if ({lhs_nm_ctor}) free({lhs_nm_ctor});")
+                            out.append(" " * indent + f"{lhs_nm_ctor} = ({lv_ctor.ctype}*) malloc(sizeof({lv_ctor.ctype}) * {n_ctor});")
+                            out.append(" " * indent + f"if (!{lhs_nm_ctor} && {n_ctor} > 0) {fail_stmt}")
                         if len(_dim_parts(lv_ctor.dim)) == 1:
                             out.append(" " * indent + f"{_alloc_len_name(lhs_nm_ctor)} = {n_ctor};")
                     for k, it in enumerate([x.strip() for x in ctor_items if x.strip()]):
                         cv = _convert_expr(it, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
-                        out.append(" " * indent + f"{lhs_nm_ctor}[{k}] = {cv};")
+                        if lv_ctor.is_allocatable and (lv_ctor.ctype or "").lower() == "char *":
+                            out.append(" " * indent + f"assign_str_alloc(&{lhs_nm_ctor}[{k}], {cv});")
+                        elif lv_ctor.char_len:
+                            clen_ctor = _convert_expr(lv_ctor.char_len, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                            out.append(" " * indent + f"assign_str({lhs_nm_ctor}[{k}], {clen_ctor}, {cv});")
+                        else:
+                            out.append(" " * indent + f"{lhs_nm_ctor}[{k}] = {cv};")
                     continue
             if m_rhs_ctor and '%' in lhs_raw:
                 parts = [x.strip().lower() for x in lhs_raw.split('%') if x.strip()]
@@ -14138,11 +14343,34 @@ def _transpile_unit(
                 if vals is not None and len(vals) == 1:
                     return vals[0]
                 return m.group(0)
-            line = re.sub(
-                r"(?i)\bsize\s*\(\s*([a-z_]\w*)\s*(?:,\s*([0-9]+)\s*)?\)",
-                _size_repl_late,
-                line,
-            )
+            parts_late: List[str] = []
+            i_late = 0
+            while i_late < len(line):
+                if line[i_late] in {"'", '"'}:
+                    q_late = line[i_late]
+                    j_late = i_late + 1
+                    while j_late < len(line):
+                        if line[j_late] == q_late:
+                            if j_late + 1 < len(line) and line[j_late + 1] == q_late:
+                                j_late += 2
+                                continue
+                            break
+                        j_late += 1
+                    parts_late.append(line[i_late : min(j_late + 1, len(line))])
+                    i_late = min(j_late + 1, len(line))
+                    continue
+                j_late = i_late
+                while j_late < len(line) and line[j_late] not in {"'", '"'}:
+                    j_late += 1
+                parts_late.append(
+                    re.sub(
+                        r"(?i)\bsize\s*\(\s*([a-z_]\w*)\s*(?:,\s*([0-9]+)\s*)?\)",
+                        _size_repl_late,
+                        line[i_late:j_late],
+                    )
+                )
+                i_late = j_late
+            line = "".join(parts_late)
         if "'" in line:
             line = _replace_single_quoted_literals_outside_double(line)
         return line
