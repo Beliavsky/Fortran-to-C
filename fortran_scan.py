@@ -242,17 +242,31 @@ def split_fortran_units_simple(text: str) -> List[Dict[str, object]]:
         in_contains = False
         contains_lineno = None
         end_lineno = hdr_lineno
+        interface_depth = 0
         while j < len(stmts):
             lineno_j, stmt_j = stmts[j]
             c = stmt_j.strip()
             low_j = c.lower()
             if not in_contains:
+                if INTERFACE_START_RE.match(low_j):
+                    interface_depth += 1
+                    body.append(stmt_j)
+                    body_line_nos.append(lineno_j)
+                    j += 1
+                    continue
+                if END_INTERFACE_RE.match(low_j):
+                    if interface_depth > 0:
+                        interface_depth -= 1
+                    body.append(stmt_j)
+                    body_line_nos.append(lineno_j)
+                    j += 1
+                    continue
                 if low_j == 'contains':
                     in_contains = True
                     contains_lineno = lineno_j
                     j += 1
                     continue
-                if end_re.match(low_j) or low_j == 'end':
+                if interface_depth == 0 and (end_re.match(low_j) or low_j == 'end'):
                     end_lineno = lineno_j
                     break
                 if stmt_j:
@@ -510,6 +524,41 @@ def find_implicit_none_undeclared_identifiers(
                 start_idx = -1
         return names, ranges
 
+    def _local_interface_info(body: List[str]) -> Tuple[Set[str], List[Tuple[int, int]]]:
+        names: Set[str] = set()
+        ranges: List[Tuple[int, int]] = []
+        depth = 0
+        start_idx = -1
+        for idx, stmt in enumerate(body):
+            code = strip_comment(stmt).strip()
+            if not code:
+                continue
+            low = code.lower()
+            if INTERFACE_START_RE.match(low):
+                if depth == 0:
+                    start_idx = idx
+                depth += 1
+                continue
+            if END_INTERFACE_RE.match(low):
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start_idx >= 0:
+                        ranges.append((start_idx, idx))
+                        start_idx = -1
+                continue
+            if depth > 0:
+                m_sub = re.match(r"^(?:(?:pure|elemental|impure|recursive|module)\s+)*subroutine\s+([a-z_]\w*)\b", low)
+                if m_sub:
+                    names.add(m_sub.group(1).lower())
+                    continue
+                m_fun = re.match(
+                    r"^(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|double\s+precision)\s+)?function\s+([a-z_]\w*)\b",
+                    low,
+                )
+                if m_fun:
+                    names.add(m_fun.group(1).lower())
+        return names, ranges
+
     def _index_in_ranges(idx: int, ranges: List[Tuple[int, int]]) -> bool:
         for lo, hi in ranges:
             if lo <= idx <= hi:
@@ -529,9 +578,11 @@ def find_implicit_none_undeclared_identifiers(
         imported: Set[str] = set()
         host_declared = _host_declared_before_unit(u)
         derived_type_names, type_block_ranges = _local_derived_info(body)
+        interface_proc_names, interface_block_ranges = _local_interface_info(body)
         declared |= derived_type_names
+        declared |= interface_proc_names
         for idx, stmt in enumerate(body):
-            if _index_in_ranges(idx, type_block_ranges):
+            if _index_in_ranges(idx, type_block_ranges) or _index_in_ranges(idx, interface_block_ranges):
                 continue
             code = strip_comment(stmt).strip()
             if not code:
@@ -559,7 +610,7 @@ def find_implicit_none_undeclared_identifiers(
 
         # Validate declaration-spec identifiers (e.g. kind=dp, x(n)).
         for idx, stmt in enumerate(body):
-            if _index_in_ranges(idx, type_block_ranges):
+            if _index_in_ranges(idx, type_block_ranges) or _index_in_ranges(idx, interface_block_ranges):
                 continue
             code = strip_comment(stmt).strip()
             if not code or "::" not in code or not declish_re.match(code):
@@ -568,6 +619,7 @@ def find_implicit_none_undeclared_identifiers(
             lhs, rhs = code.split("::", 1)
             scan_txt = _strip_string_literals(lhs + " " + rhs)
             scan_txt = re.sub(r"%\s*[a-z_]\w*", "", scan_txt, flags=re.IGNORECASE)
+            scan_txt = re.sub(r"(?<=[0-9.])_[a-z_]\w*\b", "", scan_txt, flags=re.IGNORECASE)
             kw_arg_names = {m.group(1).lower() for m in re.finditer(r"\b([a-z_]\w*)\s*=", scan_txt, flags=re.IGNORECASE)}
             for tok in re.findall(r"\b[a-z_]\w*\b", scan_txt, flags=re.IGNORECASE):
                 t = tok.lower()
@@ -583,12 +635,13 @@ def find_implicit_none_undeclared_identifiers(
                 break
 
         for idx, stmt in enumerate(body):
-            if _index_in_ranges(idx, type_block_ranges):
+            if _index_in_ranges(idx, type_block_ranges) or _index_in_ranges(idx, interface_block_ranges):
                 continue
             code = strip_comment(stmt).strip()
-            low = code.lower()
             if not code:
                 continue
+            code = re.sub(r"^\d+\s+", "", code, count=1)
+            low = code.lower()
             m_assoc = re.match(r"^associate\s*\((.*)\)\s*$", code, re.IGNORECASE)
             if m_assoc:
                 names_here: Set[str] = set()
@@ -617,9 +670,21 @@ def find_implicit_none_undeclared_identifiers(
                 continue
             if re.match(r"^if\s*\(.+\)\s*(?:exit|cycle)(?:\s+[a-z_]\w*)?\s*$", low):
                 continue
+            if low == "continue":
+                continue
+            if re.match(r"^(?:go\s+to|goto)\s+\d+\s*$", low):
+                continue
+            if re.match(r"^if\s*\(.+\)\s*(?:go\s+to|goto)\s+\d+\s*$", low):
+                continue
+            if re.match(r"^if\s*\(.+\)\s*stop(?:\s*\(\s*[^)]*\s*\)|\s+.+)?\s*$", low):
+                continue
             if low.startswith("allocate(") or low.startswith("allocate ("):
                 continue
             if low.startswith("deallocate(") or low.startswith("deallocate ("):
+                continue
+            if low.startswith("close(") or low.startswith("close ("):
+                continue
+            if re.match(r"^if\s*\(.+\)\s*close\s*\(.*\)\s*$", low):
                 continue
             if "::" in code and declish_re.match(code):
                 continue
@@ -651,6 +716,7 @@ def find_implicit_none_undeclared_identifiers(
 
             scan_txt = _strip_string_literals(code)
             scan_txt = re.sub(r"%\s*[a-z_]\w*", "", scan_txt, flags=re.IGNORECASE)
+            scan_txt = re.sub(r"(?<=[0-9.])_[a-z_]\w*\b", "", scan_txt, flags=re.IGNORECASE)
             kw_arg_names = {m.group(1).lower() for m in re.finditer(r"\b([a-z_]\w*)\s*=", scan_txt, flags=re.IGNORECASE)}
             for tok in re.findall(r"\b[a-z_]\w*\b", scan_txt, flags=re.IGNORECASE):
                 t = tok.lower()
@@ -703,9 +769,10 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
 
     for lineno, stmt in iter_fortran_statements(lines):
         s = stmt.strip()
-        low = s.lower()
         if not s:
             continue
+        s_norm = re.sub(r"^\d+\s+", "", s, count=1)
+        low = s_norm.lower()
         if not _balanced_parens(s):
             errs.append(f"line {lineno}: unbalanced parentheses in statement: {s}")
             continue
@@ -852,6 +919,14 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
             if not unit_stack:
                 in_implicit_main = True
             continue
+        if low == "continue":
+            if not unit_stack:
+                in_implicit_main = True
+            continue
+        if re.match(r"^(?:go\s+to|goto)\s+\d+\s*$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
         if low == "return":
             if not unit_stack:
                 in_implicit_main = True
@@ -936,11 +1011,23 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
             if not unit_stack:
                 in_implicit_main = True
             continue
+        if re.match(r"^if\s*\(.+\)\s*(?:go\s+to|goto)\s+\d+\s*$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
+        if re.match(r"^if\s*\(.+\)\s*stop(?:\s*\(\s*[^)]*\s*\)|\s+.+)?\s*$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
         if re.match(r"^if\s*\(.+\)\s*error\s+stop(?:\s*\(\s*[^)]*\s*\)|\s+.+)?\s*$", low):
             if not unit_stack:
                 in_implicit_main = True
             continue
         if re.match(r"^if\s*\(.+\)\s*write\s*\(.*\)\s*(?:,\s*.+|\s+.+)?$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
+        if re.match(r"^if\s*\(.+\)\s*close\s*\(.*\)\s*$", low):
             if not unit_stack:
                 in_implicit_main = True
             continue

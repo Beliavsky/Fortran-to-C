@@ -367,6 +367,30 @@ int write_int_float_record(int unit, int iw, int fw, int fd, int iv, double rv) 
 }
 
 
+int write_first_int_unit(int unit, int v) {
+   /* Write one list-directed INTEGER item to an external unit. */
+   FILE *fp = unit_get(unit);
+   if (!fp) return 1;
+   return fprintf(fp, "%d\n", v) < 0 ? 1 : 0;
+}
+
+
+int write_first_float_unit(int unit, float v) {
+   /* Write one list-directed REAL item to an external unit. */
+   FILE *fp = unit_get(unit);
+   if (!fp) return 1;
+   return fprintf(fp, "%.8g\n", v) < 0 ? 1 : 0;
+}
+
+
+int write_first_double_unit(int unit, double v) {
+   /* Write one list-directed DOUBLE PRECISION item to an external unit. */
+   FILE *fp = unit_get(unit);
+   if (!fp) return 1;
+   return fprintf(fp, "%.17g\n", v) < 0 ? 1 : 0;
+}
+
+
 int read_a(int unit, char *buf, int len) {
    /* Read one character record and blank-pad the destination buffer. */
    FILE *fp = unit_get(unit);
@@ -409,6 +433,36 @@ int read_int_double_record(int unit, int *iv, double *rv) {
    *iv = itmp;
    *rv = rtmp;
    return 0;
+}
+
+
+int read_first_int_unit(int unit, int *out) {
+   /* Read the leading INTEGER item from an external list-directed record. */
+   char buf[256];
+   FILE *fp = unit_get(unit);
+   if (!fp || !out) return 1;
+   if (!fgets(buf, (int) sizeof(buf), fp)) return 1;
+   return read_first_int_s(buf, out);
+}
+
+
+int read_first_float_unit(int unit, float *out) {
+   /* Read the leading REAL item from an external list-directed record. */
+   char buf[256];
+   FILE *fp = unit_get(unit);
+   if (!fp || !out) return 1;
+   if (!fgets(buf, (int) sizeof(buf), fp)) return 1;
+   return read_first_float_s(buf, out);
+}
+
+
+int read_first_double_unit(int unit, double *out) {
+   /* Read the leading DOUBLE PRECISION item from an external list-directed record. */
+   char buf[256];
+   FILE *fp = unit_get(unit);
+   if (!fp || !out) return 1;
+   if (!fgets(buf, (int) sizeof(buf), fp)) return 1;
+   return read_first_double_s(buf, out);
 }
 
 

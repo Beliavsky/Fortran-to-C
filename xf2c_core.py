@@ -28,6 +28,7 @@ class Var:
     ptr_init: Optional[str] = None
     comment: Optional[str] = None
     char_len: Optional[str] = None
+    proc_sig: Optional[str] = None
 
 
 _ACTIVE_DERIVED_TYPES: Dict[str, List[tuple[str, str]]] = {}
@@ -562,8 +563,13 @@ def _as_c_inline_comment(text: Optional[str]) -> str:
 
 
 def _fortran_to_c_real_type(text: str) -> str:
-    # If code defines dp from kind(1.0d0), use double.
+    # If code clearly opts into double-precision kinds, use double as the
+    # default real lowering fallback.
     if re.search(r"kind\s*\(\s*1\.0d0\s*\)", text, re.IGNORECASE):
+        return "double"
+    if re.search(r"selected_real_kind\s*\(", text, re.IGNORECASE):
+        return "double"
+    if re.search(r"\breal64\b", text, re.IGNORECASE):
         return "double"
     return "float"
 
@@ -1293,7 +1299,18 @@ def _format_item_ctype(expr: str, vars_map: Dict[str, Var], real_type: str) -> s
         if kind_tok.isdigit() and int(kind_tok) >= 8:
             return 'long long'
         return 'int'
-    if re.fullmatch(r"[+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+\-]?\d+)?(?:_(?:[a-z_]\w*|\d+))?", s, re.IGNORECASE):
+    m_real_lit = re.fullmatch(r"[+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+\-]?\d+)?(?:_([a-z_]\w*|\d+))?", s, re.IGNORECASE)
+    if m_real_lit:
+        kind_tok = (m_real_lit.group(1) or "").lower()
+        if kind_tok in {"dp", "real64"}:
+            return "double"
+        if kind_tok.isdigit() and int(kind_tok) >= 8:
+            return "double"
+        vv_kind = vars_map.get(kind_tok) if kind_tok else None
+        if vv_kind is not None and vv_kind.is_param:
+            init_l = (vv_kind.init or "").lower()
+            if "selected_real_kind" in init_l or "kind(1.0d0)" in init_l or "real64" in init_l:
+                return "double"
         return real_type.lower()
     if re.match(r'^(?:allocated|present)\s*\(', s, re.IGNORECASE):
         return 'logical'
@@ -1338,6 +1355,17 @@ def _format_item_ctype(expr: str, vars_map: Dict[str, Var], real_type: str) -> s
         vv = vars_map.get(m_sub.group(1).lower())
         if vv is not None and (vv.ctype or '').lower() == 'char *' and not vv.is_array:
             return 'string'
+    m_arr_ref = re.match(r'^([a-z_]\w*)\s*\((.*)\)$', s, re.IGNORECASE)
+    if m_arr_ref:
+        vv = vars_map.get(m_arr_ref.group(1).lower())
+        if vv is not None and vv.is_array:
+            if (vv.ctype or '').lower() == 'char *':
+                return 'string'
+            if vv.is_logical:
+                return 'logical'
+            if _is_complex_ctype(vv.ctype):
+                return 'complex'
+            return (vv.ctype or real_type).lower()
     m_part = re.match(r'^([a-z_]\w*)\s*%\s*(re|im)\s*$', s, re.IGNORECASE)
     if m_part:
         vv = vars_map.get(m_part.group(1).lower())
@@ -2187,6 +2215,50 @@ def _emit_basic_formatted_items_output(
             pf = _printf_fmt_for_basic_format_token(tok, val_ctype or real_type).replace('\\', '\\\\').replace('"', '\\"')
             out.append(' ' * indent + f'printf("{pf}", {val_expr});')
     data_fixed = sum(1 for tok in fixed_toks if tok.get('kind') == 'data')
+    if repeat_group is None and len(items) >= 2:
+        m_arr_last = re.match(r'^([a-z_]\w*)$', items[-1].strip(), re.IGNORECASE)
+        if m_arr_last:
+            an = m_arr_last.group(1).lower()
+            av = vars_map.get(an)
+            if av is not None and av.is_array and len(_resolved_dim_parts(av, an, assumed_extents)) == 1:
+                prefix_vals = vals[:-1]
+                data_seen = 0
+                d1 = _convert_expr(
+                    _resolved_dim_parts(av, an, assumed_extents)[0],
+                    vars_map,
+                    real_type,
+                    byref_scalars,
+                    assumed_extents,
+                    proc_arg_extent_names,
+                )
+                ctype = (av.ctype or real_type).lower()
+                out.append(' ' * indent + '{')
+                out.append(' ' * (indent + 3) + 'int __idx_arr = 0;')
+                for tok in fixed_toks:
+                    kind = tok.get('kind')
+                    if kind == 'space':
+                        nsp = int(tok.get('count', 1))
+                        lit = (' ' * nsp).replace('\\', '\\\\').replace('"', '\\"')
+                        out.append(' ' * (indent + 3) + f'printf("%s", "{lit}");')
+                    elif kind == 'newline':
+                        nlb = int(tok.get('count', 1))
+                        for _ in range(nlb):
+                            out.append(' ' * (indent + 3) + 'printf("\\n");')
+                    elif kind == 'literal':
+                        lit = str(tok.get('text', '')).replace('\\', '\\\\').replace('"', '\\"')
+                        out.append(' ' * (indent + 3) + f'printf("%s", "{lit}");')
+                    elif kind == 'data':
+                        if data_seen < len(prefix_vals):
+                            pf = _printf_fmt_for_basic_format_token(tok, prefix_vals[data_seen][1] or real_type).replace('\\', '\\\\').replace('"', '\\"')
+                            out.append(' ' * (indent + 3) + f'printf("{pf}", {prefix_vals[data_seen][0]});')
+                        else:
+                            pf = _printf_fmt_for_basic_format_token(tok, ctype).replace('\\', '\\\\').replace('"', '\\"')
+                            out.append(' ' * (indent + 3) + f'if (__idx_arr < {d1}) printf("{pf}", {an}[__idx_arr]);')
+                            out.append(' ' * (indent + 3) + '__idx_arr += 1;')
+                        data_seen += 1
+                out.append(' ' * indent + '}')
+                out.append(' ' * indent + 'printf("\\n");')
+                return True
     if repeat_group is not None:
         vi = 0
         for tok in fixed_toks:
@@ -2507,7 +2579,7 @@ def _replace_pow(expr: str) -> str:
     # Conservative repeated replacement for simple operands.
     var = r"[a-z_]\w*(?:\[[^\[\]]+\])*"
     num = r"[0-9]+(?:\.[0-9]*)?(?:[eEdD][+\-]?\d+)?"
-    par = r"\([^()]+\)"
+    par = r"\((?:[^()]|\([^()]*\))*\)"
     pat_int = re.compile(
         rf"({var}|{par}|{num})\s*\*\*\s*([0-9]+)",
         re.IGNORECASE,
@@ -3430,6 +3502,134 @@ def _shape_like_intrinsic_values(
 ) -> Optional[List[str]]:
     if not args:
         return None
+    if nm in {"minloc", "maxloc", "findloc"}:
+        if nm in {"minloc", "maxloc"}:
+            if len(args) < 1:
+                return None
+            arr_arg = args[0].strip()
+            val_arg = None
+            extras = args[1:]
+        else:
+            if len(args) < 2:
+                return None
+            arr_arg = args[0].strip()
+            val_arg = args[1].strip()
+            extras = args[2:]
+        if not re.fullmatch(r"[a-z_]\w*", arr_arg, re.IGNORECASE):
+            return None
+        a0 = arr_arg.lower()
+        av0 = vars_map.get(a0)
+        if av0 is None or not av0.is_array:
+            return None
+        dparts0 = _resolved_dim_parts(av0, a0, assumed_extents)
+        rank0 = len(dparts0)
+        if rank0 not in {1, 2}:
+            return None
+        cty0 = (av0.ctype or real_type).lower()
+        if cty0 not in {"int", "float", "double"}:
+            return None
+        dim_no: Optional[int] = None
+        back_expr = "0"
+        for extra in extras:
+            m_dim_kw = re.match(r"(?i)^dim\s*=\s*([0-9]+)$", extra)
+            if m_dim_kw:
+                dim_no = int(m_dim_kw.group(1))
+                break
+            if re.fullmatch(r"[0-9]+", extra):
+                dim_no = int(extra)
+                break
+        for extra in extras:
+            m_back_kw = re.match(r"(?i)^back\s*=\s*(.+)$", extra)
+            if m_back_kw:
+                back_expr = _convert_expr(
+                    m_back_kw.group(1).strip(),
+                    vars_map,
+                    real_type,
+                    byref_scalars,
+                    assumed_extents,
+                    proc_arg_extent_names,
+                )
+                break
+        d1 = _convert_expr(dparts0[0], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+        d2 = _convert_expr(dparts0[1], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names) if rank0 == 2 else None
+        val_c = _convert_expr(val_arg, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names) if val_arg is not None else None
+        cmp_expr = "<" if nm == "minloc" else ">"
+        if rank0 == 1 and dim_no in {None, 1}:
+            if nm == "findloc":
+                return [
+                    "({ int __loc = 0; int __found = 0; "
+                    f"if ({back_expr}) {{ for (int i_pr = ({d1}) - 1; i_pr >= 0; --i_pr) {{ if ({a0}[i_pr] == {val_c}) {{ __loc = i_pr; __found = 1; break; }} }} }} "
+                    f"else {{ for (int i_pr = 0; i_pr < ({d1}); ++i_pr) {{ if ({a0}[i_pr] == {val_c}) {{ __loc = i_pr; __found = 1; break; }} }} }} "
+                    "(__found ? (__loc + 1) : 0); })"
+                ]
+            return [
+                "({ int __loc = 0; "
+                f"{cty0} __best = {a0}[0]; "
+                f"for (int i_pr = 1; i_pr < ({d1}); ++i_pr) {{ if ({a0}[i_pr] {cmp_expr} __best || (({back_expr}) && ({a0}[i_pr] == __best))) {{ __best = {a0}[i_pr]; __loc = i_pr; }} }} "
+                "(__loc + 1); })"
+            ]
+        if dim_no is None:
+            if rank0 != 2:
+                return None
+            n_total = _dim_product_from_parts(dparts0, vars_map, real_type, byref_scalars, assumed_extents)
+            if nm == "findloc":
+                base = (
+                    "({ int __loc = 0; int __found = 0; "
+                    f"if ({back_expr}) {{ for (int i_pr = ({n_total}) - 1; i_pr >= 0; --i_pr) {{ if ({a0}[i_pr] == {val_c}) {{ __loc = i_pr; __found = 1; break; }} }} }} "
+                    f"else {{ for (int i_pr = 0; i_pr < ({n_total}); ++i_pr) {{ if ({a0}[i_pr] == {val_c}) {{ __loc = i_pr; __found = 1; break; }} }} }} "
+                )
+                return [
+                    base + f"(__found ? ((__loc % ({d1})) + 1) : 0); }})",
+                    base + f"(__found ? ((__loc / ({d1})) + 1) : 0); }})",
+                ]
+            base = (
+                "({ int __loc = 0; "
+                f"{cty0} __best = {a0}[0]; "
+                f"for (int i_pr = 1; i_pr < ({n_total}); ++i_pr) {{ if ({a0}[i_pr] {cmp_expr} __best || (({back_expr}) && ({a0}[i_pr] == __best))) {{ __best = {a0}[i_pr]; __loc = i_pr; }} }} "
+            )
+            return [
+                base + f"((__loc % ({d1})) + 1); }})",
+                base + f"((__loc / ({d1})) + 1); }})",
+            ]
+        if rank0 != 2 or dim_no not in {1, 2}:
+            return None
+        out_len_expr = d2 if dim_no == 1 else d1
+        out_len_int = _eval_int_expr(out_len_expr)
+        if out_len_int is None:
+            return None
+        vals_loc: List[str] = []
+        for outer in range(int(out_len_int)):
+            if nm == "findloc":
+                if dim_no == 1:
+                    vals_loc.append(
+                        "({ int __locv = 0; int __found = 0; "
+                        f"if ({back_expr}) {{ for (int i_pr = ({d1}) - 1; i_pr >= 0; --i_pr) {{ if ({a0}[i_pr + ({d1}) * {outer}] == {val_c}) {{ __locv = i_pr + 1; __found = 1; break; }} }} }} "
+                        f"else {{ for (int i_pr = 0; i_pr < ({d1}); ++i_pr) {{ if ({a0}[i_pr + ({d1}) * {outer}] == {val_c}) {{ __locv = i_pr + 1; __found = 1; break; }} }} }} "
+                        "__locv; })"
+                    )
+                else:
+                    vals_loc.append(
+                        "({ int __locv = 0; int __found = 0; "
+                        f"if ({back_expr}) {{ for (int j_pr = ({d2}) - 1; j_pr >= 0; --j_pr) {{ if ({a0}[{outer} + ({d1}) * j_pr] == {val_c}) {{ __locv = j_pr + 1; __found = 1; break; }} }} }} "
+                        f"else {{ for (int j_pr = 0; j_pr < ({d2}); ++j_pr) {{ if ({a0}[{outer} + ({d1}) * j_pr] == {val_c}) {{ __locv = j_pr + 1; __found = 1; break; }} }} }} "
+                        "__locv; })"
+                    )
+            else:
+                if dim_no == 1:
+                    vals_loc.append(
+                        "({ int __locv = 0; "
+                        f"{cty0} __best = {a0}[({d1}) * {outer}]; "
+                        f"for (int i_pr = 1; i_pr < ({d1}); ++i_pr) {{ if ({a0}[i_pr + ({d1}) * {outer}] {cmp_expr} __best || (({back_expr}) && ({a0}[i_pr + ({d1}) * {outer}] == __best))) {{ __best = {a0}[i_pr + ({d1}) * {outer}]; __locv = i_pr; }} }} "
+                        "(__locv + 1); })"
+                    )
+                else:
+                    vals_loc.append(
+                        "({ int __locv = 0; "
+                        f"{cty0} __best = {a0}[{outer}]; "
+                        f"for (int j_pr = 1; j_pr < ({d2}); ++j_pr) {{ if ({a0}[{outer} + ({d1}) * j_pr] {cmp_expr} __best || (({back_expr}) && ({a0}[{outer} + ({d1}) * j_pr] == __best))) {{ __best = {a0}[{outer} + ({d1}) * j_pr]; __locv = j_pr; }} }} "
+                        "(__locv + 1); })"
+                    )
+        return vals_loc
     arg0 = args[0].strip()
     sec_shape = _section_shape_exprs(
         arg0,
@@ -3716,6 +3916,260 @@ def _emit_list_directed_loc_intrinsic(
         out.append(" " * (indent + 3) + "}")
 
     out.append(" " * (indent + 3) + 'printf("\\n");')
+    out.append(" " * indent + "}")
+    return True
+
+
+def _emit_loc_assignment(
+    out: List[str],
+    indent: int,
+    lhs_raw: str,
+    rhs_raw: str,
+    vars_map: Dict[str, Var],
+    real_type: str,
+    fail_stmt: str,
+    byref_scalars: Optional[set[str]] = None,
+    assumed_extents: Optional[Dict[str, List[str]]] = None,
+    proc_arg_extent_names: Optional[Dict[str, List[List[str]]]] = None,
+) -> bool:
+    m_loc = re.match(r"^(minloc|maxloc|findloc)\s*\((.*)\)\s*$", rhs_raw.strip(), re.IGNORECASE)
+    if not m_loc:
+        return False
+    nm = m_loc.group(1).lower()
+    args = [x.strip() for x in _split_args_top_level(m_loc.group(2)) if x.strip()]
+    if nm in {"minloc", "maxloc"}:
+        if len(args) < 1:
+            return False
+        arr_arg = args[0]
+        val_arg = None
+        extras = args[1:]
+    else:
+        if len(args) < 2:
+            return False
+        arr_arg = args[0]
+        val_arg = args[1]
+        extras = args[2:]
+    dim_no: Optional[int] = None
+    back_expr = "0"
+    for extra in extras:
+        m_dim_kw = re.match(r"(?i)^dim\s*=\s*([0-9]+)$", extra)
+        if m_dim_kw:
+            dim_no = int(m_dim_kw.group(1))
+            break
+        if re.fullmatch(r"[0-9]+", extra):
+            dim_no = int(extra)
+            break
+    for extra in extras:
+        m_back_kw = re.match(r"(?i)^back\s*=\s*(.+)$", extra)
+        if m_back_kw:
+            back_expr = _convert_expr(
+                m_back_kw.group(1).strip(),
+                vars_map,
+                real_type,
+                byref_scalars,
+                assumed_extents,
+                proc_arg_extent_names,
+            )
+            break
+
+    def _emit_loc_store(vals: List[str]) -> bool:
+        m_lhs_name = re.match(r"^([a-z_]\w*)$", lhs_raw, re.IGNORECASE)
+        if m_lhs_name:
+            lhs_nm = m_lhs_name.group(1).lower()
+            lv = vars_map.get(lhs_nm)
+            if lv is not None and lv.is_array and len(_dim_parts(lv.dim)) == 1:
+                if lv.is_allocatable:
+                    out.append(" " * indent + f"if ({lhs_nm}) free({lhs_nm});")
+                    out.append(" " * indent + f"{lhs_nm} = (int*) malloc(sizeof(int) * {len(vals)});")
+                    out.append(" " * indent + f"if (!{lhs_nm} && {len(vals)} > 0) {fail_stmt}")
+                    out.append(" " * indent + f"{_alloc_len_name(lhs_nm)} = {len(vals)};")
+                for k, v in enumerate(vals):
+                    out.append(" " * indent + f"{lhs_nm}[{k}] = {v};")
+                return True
+        if len(vals) != 1:
+            return False
+        lhs = _convert_expr(
+            lhs_raw,
+            vars_map,
+            real_type,
+            byref_scalars,
+            assumed_extents,
+            proc_arg_extent_names,
+        )
+        out.append(" " * indent + f"{lhs} = {vals[0]};")
+        return True
+
+    rank1_term = _rewrite_rank1_view_expr(
+        arr_arg,
+        "i_pr",
+        vars_map,
+        real_type,
+        byref_scalars,
+        assumed_extents,
+        proc_arg_extent_names,
+    )
+    if rank1_term is not None:
+        if dim_no not in {None, 1}:
+            return False
+        elem_c, extent_raw, cty = rank1_term
+        if (cty or real_type).lower() not in {"int", "float", "double"}:
+            return False
+        extent_c = _convert_expr(
+            extent_raw,
+            vars_map,
+            real_type,
+            byref_scalars,
+            assumed_extents,
+            proc_arg_extent_names,
+        )
+        val_c = (
+            _convert_expr(
+                val_arg,
+                vars_map,
+                real_type,
+                byref_scalars,
+                assumed_extents,
+                proc_arg_extent_names,
+            )
+            if val_arg is not None
+            else None
+        )
+        cmp_expr = "<" if nm == "minloc" else ">"
+        out.append(" " * indent + "{")
+        out.append(" " * (indent + 3) + "int __loc = 0;")
+        if nm == "findloc":
+            out.append(" " * (indent + 3) + "int __found = 0;")
+            out.append(" " * (indent + 3) + f"if ({back_expr}) {{")
+            out.append(" " * (indent + 6) + f"for (int i_pr = ({extent_c}) - 1; i_pr >= 0; --i_pr) {{")
+            out.append(" " * (indent + 9) + f"if ({elem_c} == {val_c}) {{ __loc = i_pr; __found = 1; break; }}")
+            out.append(" " * (indent + 6) + "}")
+            out.append(" " * (indent + 3) + "} else {")
+            out.append(" " * (indent + 6) + f"for (int i_pr = 0; i_pr < ({extent_c}); ++i_pr) {{")
+            out.append(" " * (indent + 9) + f"if ({elem_c} == {val_c}) {{ __loc = i_pr; __found = 1; break; }}")
+            out.append(" " * (indent + 6) + "}")
+            out.append(" " * (indent + 3) + "}")
+            comp = "(__found ? (__loc + 1) : 0)"
+        else:
+            out.append(" " * (indent + 3) + f"{cty} __best;")
+            out.append(" " * (indent + 3) + "int i_pr = 0;")
+            out.append(" " * (indent + 3) + "__best = " + elem_c + ";")
+            out.append(" " * (indent + 3) + f"for (i_pr = 1; i_pr < ({extent_c}); ++i_pr) {{")
+            out.append(" " * (indent + 6) + f"if ({elem_c} {cmp_expr} __best || (({back_expr}) && ({elem_c} == __best))) {{ __best = {elem_c}; __loc = i_pr; }}")
+            out.append(" " * (indent + 3) + "}")
+            comp = "(__loc + 1)"
+        if not _emit_loc_store([comp]):
+            return False
+        out.append(" " * indent + "}")
+        return True
+
+    if not re.fullmatch(r"[a-z_]\w*", arr_arg, re.IGNORECASE):
+        return False
+    arr = arr_arg.lower()
+    av = vars_map.get(arr)
+    if av is None or not av.is_array:
+        return False
+    dparts = _resolved_dim_parts(av, arr, assumed_extents)
+    rank = len(dparts)
+    if rank != 2:
+        return False
+    cty = (av.ctype or real_type).lower()
+    if cty not in {"int", "float", "double"}:
+        return False
+    d1 = _convert_expr(dparts[0], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+    d2 = _convert_expr(dparts[1], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+    n_total = _dim_product_from_parts(dparts, vars_map, real_type, byref_scalars, assumed_extents)
+    val_c = (
+        _convert_expr(
+            val_arg,
+            vars_map,
+            real_type,
+            byref_scalars,
+            assumed_extents,
+            proc_arg_extent_names,
+        )
+        if val_arg is not None
+        else None
+    )
+    cmp_expr = "<" if nm == "minloc" else ">"
+    if dim_no is None:
+        out.append(" " * indent + "{")
+        out.append(" " * (indent + 3) + "int __loc = 0;")
+        if nm == "findloc":
+            out.append(" " * (indent + 3) + "int __found = 0;")
+            out.append(" " * (indent + 3) + f"if ({back_expr}) {{")
+            out.append(" " * (indent + 6) + f"for (int i_pr = ({n_total}) - 1; i_pr >= 0; --i_pr) {{")
+            out.append(" " * (indent + 9) + f"if ({arr}[i_pr] == {val_c}) {{ __loc = i_pr; __found = 1; break; }}")
+            out.append(" " * (indent + 6) + "}")
+            out.append(" " * (indent + 3) + "} else {")
+            out.append(" " * (indent + 6) + f"for (int i_pr = 0; i_pr < ({n_total}); ++i_pr) {{")
+            out.append(" " * (indent + 9) + f"if ({arr}[i_pr] == {val_c}) {{ __loc = i_pr; __found = 1; break; }}")
+            out.append(" " * (indent + 6) + "}")
+            out.append(" " * (indent + 3) + "}")
+            comp1 = f"(__found ? ((__loc % ({d1})) + 1) : 0)"
+            comp2 = f"(__found ? ((__loc / ({d1})) + 1) : 0)"
+        else:
+            out.append(" " * (indent + 3) + f"{cty} __best = {arr}[0];")
+            out.append(" " * (indent + 3) + f"for (int i_pr = 1; i_pr < ({n_total}); ++i_pr) {{")
+            out.append(" " * (indent + 6) + f"if ({arr}[i_pr] {cmp_expr} __best || (({back_expr}) && ({arr}[i_pr] == __best))) {{ __best = {arr}[i_pr]; __loc = i_pr; }}")
+            out.append(" " * (indent + 3) + "}")
+            comp1 = f"((__loc % ({d1})) + 1)"
+            comp2 = f"((__loc / ({d1})) + 1)"
+        if not _emit_loc_store([comp1, comp2]):
+            return False
+        out.append(" " * indent + "}")
+        return True
+    if dim_no not in {1, 2}:
+        return False
+    m_lhs_name = re.match(r"^([a-z_]\w*)$", lhs_raw, re.IGNORECASE)
+    if not m_lhs_name:
+        return False
+    lhs_nm = m_lhs_name.group(1).lower()
+    lv = vars_map.get(lhs_nm)
+    if lv is None or (not lv.is_array) or len(_dim_parts(lv.dim)) != 1:
+        return False
+    out_len = d2 if dim_no == 1 else d1
+    outer_name = "j_pr" if dim_no == 1 else "i_pr"
+    if lv.is_allocatable:
+        out.append(" " * indent + f"if ({lhs_nm}) free({lhs_nm});")
+        out.append(" " * indent + f"{lhs_nm} = (int*) malloc(sizeof(int) * ({out_len}));")
+        out.append(" " * indent + f"if (!{lhs_nm} && ({out_len}) > 0) {fail_stmt}")
+        out.append(" " * indent + f"{_alloc_len_name(lhs_nm)} = {out_len};")
+    out.append(" " * indent + f"for (int {outer_name} = 0; {outer_name} < ({out_len}); ++{outer_name}) {{")
+    out.append(" " * (indent + 3) + "int __locv = 0;")
+    if nm == "findloc":
+        out.append(" " * (indent + 3) + "int __found = 0;")
+        if dim_no == 1:
+            out.append(" " * (indent + 3) + f"if ({back_expr}) {{")
+            out.append(" " * (indent + 6) + f"for (int i_pr = ({d1}) - 1; i_pr >= 0; --i_pr) {{")
+            out.append(" " * (indent + 9) + f"if ({arr}[i_pr + ({d1}) * {outer_name}] == {val_c}) {{ __locv = i_pr + 1; __found = 1; break; }}")
+            out.append(" " * (indent + 6) + "}")
+            out.append(" " * (indent + 3) + "} else {")
+            out.append(" " * (indent + 6) + f"for (int i_pr = 0; i_pr < ({d1}); ++i_pr) {{")
+            out.append(" " * (indent + 9) + f"if ({arr}[i_pr + ({d1}) * {outer_name}] == {val_c}) {{ __locv = i_pr + 1; __found = 1; break; }}")
+            out.append(" " * (indent + 6) + "}")
+            out.append(" " * (indent + 3) + "}")
+        else:
+            out.append(" " * (indent + 3) + f"if ({back_expr}) {{")
+            out.append(" " * (indent + 6) + f"for (int j_pr = ({d2}) - 1; j_pr >= 0; --j_pr) {{")
+            out.append(" " * (indent + 9) + f"if ({arr}[{outer_name} + ({d1}) * j_pr] == {val_c}) {{ __locv = j_pr + 1; __found = 1; break; }}")
+            out.append(" " * (indent + 6) + "}")
+            out.append(" " * (indent + 3) + "} else {")
+            out.append(" " * (indent + 6) + f"for (int j_pr = 0; j_pr < ({d2}); ++j_pr) {{")
+            out.append(" " * (indent + 9) + f"if ({arr}[{outer_name} + ({d1}) * j_pr] == {val_c}) {{ __locv = j_pr + 1; __found = 1; break; }}")
+            out.append(" " * (indent + 6) + "}")
+            out.append(" " * (indent + 3) + "}")
+    else:
+        if dim_no == 1:
+            out.append(" " * (indent + 3) + f"{cty} __best = {arr}[({d1}) * {outer_name}];")
+            out.append(" " * (indent + 3) + f"for (int i_pr = 1; i_pr < ({d1}); ++i_pr) {{")
+            out.append(" " * (indent + 6) + f"if ({arr}[i_pr + ({d1}) * {outer_name}] {cmp_expr} __best || (({back_expr}) && ({arr}[i_pr + ({d1}) * {outer_name}] == __best))) {{ __best = {arr}[i_pr + ({d1}) * {outer_name}]; __locv = i_pr; }}")
+        else:
+            out.append(" " * (indent + 3) + f"{cty} __best = {arr}[{outer_name}];")
+            out.append(" " * (indent + 3) + f"for (int j_pr = 1; j_pr < ({d2}); ++j_pr) {{")
+            out.append(" " * (indent + 6) + f"if ({arr}[{outer_name} + ({d1}) * j_pr] {cmp_expr} __best || (({back_expr}) && ({arr}[{outer_name} + ({d1}) * j_pr] == __best))) {{ __best = {arr}[{outer_name} + ({d1}) * j_pr]; __locv = j_pr; }}")
+        out.append(" " * (indent + 3) + "}")
+        out.append(" " * (indent + 3) + "__locv += 1;")
+    out.append(" " * (indent + 3) + f"{lhs_nm}[{outer_name}] = __locv;")
     out.append(" " * indent + "}")
     return True
 
@@ -4122,20 +4576,73 @@ def _rewrite_assumed_shape_calls(
             continue
         raw_args = _split_args_top_level(inner) if inner.strip() else []
         new_args: List[str] = []
+        ctype_lists = _ACTIVE_PROC_ARG_CTYPES.get(callee, [])
+        temp_specs: List[tuple[str, str, str, str, str, str]] = []
         for ai, a in enumerate(raw_args):
             exts = ex_lists[ai] if ai < len(ex_lists) else []
+            if exts and len(exts) == 1:
+                rank1_view = _rewrite_rank1_view_expr(
+                    a.strip(),
+                    f"__i_arg_{ai}",
+                    vars_map,
+                    real_type,
+                    byref_scalars,
+                    assumed_extents,
+                    proc_arg_extent_names,
+                )
+                if rank1_view is not None:
+                    elem_c, extent_raw, view_ctype = rank1_view
+                    extent_expr = _convert_expr(
+                        extent_raw,
+                        vars_map,
+                        real_type,
+                        byref_scalars,
+                        assumed_extents,
+                        proc_arg_extent_names,
+                    )
+                    tmp_n = f"__n_arg_{ai}"
+                    tmp_p = f"__tmp_arg_{ai}"
+                    idx_n = f"__i_arg_{ai}"
+                    base_cty = (ctype_lists[ai] if ai < len(ctype_lists) and ctype_lists[ai] else view_ctype or real_type)
+                    if base_cty.lower() == "string":
+                        base_cty = "char *"
+                    temp_specs.append((tmp_n, tmp_p, idx_n, base_cty, extent_expr, elem_c))
+                    new_args.append(tmp_n)
+                    new_args.append(tmp_p)
+                    continue
             extent_args, carg = _expand_assumed_shape_actual_arg(
                 a,
                 exts,
                 vars_map,
                 real_type,
+                ctype_lists[ai] if ai < len(ctype_lists) else None,
                 byref_scalars,
                 assumed_extents,
                 proc_arg_extent_names,
             )
             new_args.extend(extent_args)
             new_args.append(carg)
-        out.append(f"{name}({', '.join(new_args)})")
+        call_expr = f"{name}({', '.join(new_args)})"
+        if temp_specs:
+            rv = _proc_result_var(callee)
+            if rv is None or rv.is_array:
+                out.append(call_expr)
+                i = p + 1
+                continue
+            ret_ctype = rv.ctype or real_type
+            parts: List[str] = ["({ "]
+            for tmp_n, tmp_p, idx_n, base_cty, extent_expr, elem_c in temp_specs:
+                parts.append(f"int {tmp_n} = {extent_expr}; ")
+                parts.append(f"{base_cty} *{tmp_p} = ({base_cty}*) malloc(sizeof({base_cty}) * ({tmp_n})); ")
+                parts.append(f"if (!{tmp_p} && ({tmp_n}) > 0) exit(1); ")
+                parts.append(f"for (int {idx_n} = 0; {idx_n} < ({tmp_n}); ++{idx_n}) {tmp_p}[{idx_n}] = {elem_c}; ")
+            parts.append(f"{ret_ctype} __xf2c_ret = {call_expr}; ")
+            for _tmp_n, tmp_p, _idx_n, _base_cty, _extent_expr, _elem_c in temp_specs:
+                parts.append(f"free({tmp_p}); ")
+            parts.append("__xf2c_ret; })")
+            out.append("".join(parts))
+        else:
+            out.append(call_expr)
         i = p + 1
     return "".join(out)
 
@@ -4145,6 +4652,7 @@ def _expand_assumed_shape_actual_arg(
     exts: List[str],
     vars_map: Dict[str, Var],
     real_type: str,
+    dummy_ctype: Optional[str],
     byref_scalars: Optional[set[str]],
     assumed_extents: Optional[Dict[str, List[str]]],
     proc_arg_extent_names: Optional[Dict[str, List[List[str]]]],
@@ -4155,6 +4663,13 @@ def _expand_assumed_shape_actual_arg(
         ctor_items = _array_constructor_items(a_strip)
         if ctor_items is not None and len(exts) == 1:
             extent_args.append(str(len(ctor_items)))
+            if dummy_ctype:
+                base_cty = "char *" if dummy_ctype.lower() == "char *" else dummy_ctype
+                cinit = ", ".join(
+                    _convert_expr(it, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                    for it in ctor_items
+                )
+                return extent_args, f"(({base_cty}[]){{{cinit}}})"
             return extent_args, _convert_expr(a_strip, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
         m_id = re.match(r"^\s*([a-z_]\w*)\s*$", a_strip, re.IGNORECASE)
         if m_id:
@@ -5160,21 +5675,37 @@ def _convert_expr(
                         if cty == "float":
                             return f"any_eq_1d_float({n1}, {scalar_expr}, {arr_name})"
                         return f"any_eq_1d_int({n1}, {scalar_expr}, {arr_name})"
-        if nm in {"count", "any", "all"} and len(args) >= 1 and re.fullmatch(r"[a-z_]\w*", args[0], re.IGNORECASE):
-            arr = args[0].lower()
-            v = vars_map.get(arr)
-            if v is None or not v.is_array:
-                return None
-            dparts = _resolved_dim_parts(v, arr, assumed_extents)
-            rank = max(1, len(dparts))
-            if rank > 2:
-                return None
-            if rank >= 2 and len(dparts) >= 2:
-                d1 = _convert_expr(dparts[0], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
-                d2 = _convert_expr(dparts[1], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
-                return f"{nm}_{rank}d_int({d1}, {d2}, {arr})"
-            n1 = _dim_product_from_parts(dparts, vars_map, real_type, byref_scalars, assumed_extents)
-            return f"{nm}_{rank}d_int({n1}, {arr})"
+        if nm in {"count", "any", "all"} and len(args) >= 1:
+            arg0s = args[0].strip()
+            if re.fullmatch(r"[a-z_]\w*", arg0s, re.IGNORECASE):
+                arr = arg0s.lower()
+                v = vars_map.get(arr)
+                if v is not None and v.is_array:
+                    dparts = _resolved_dim_parts(v, arr, assumed_extents)
+                    rank = max(1, len(dparts))
+                    if rank <= 2:
+                        if rank >= 2 and len(dparts) >= 2:
+                            d1 = _convert_expr(dparts[0], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                            d2 = _convert_expr(dparts[1], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                            return f"{nm}_{rank}d_int({d1}, {d2}, {arr})"
+                        n1 = _dim_product_from_parts(dparts, vars_map, real_type, byref_scalars, assumed_extents)
+                        return f"{nm}_{rank}d_int({n1}, {arr})"
+            red_term = _rewrite_rank1_reduction_term(
+                arg0s,
+                "i_red",
+                vars_map,
+                real_type,
+                byref_scalars,
+                assumed_extents,
+                proc_arg_extent_names,
+            )
+            if red_term is not None:
+                elem_c, red_extent, _red_ctype = red_term
+                if nm == "count":
+                    return f"({{ int __red = 0; for (int i_red = 0; i_red < ({red_extent}); ++i_red) if ({elem_c}) ++__red; __red; }})"
+                if nm == "any":
+                    return f"({{ int __red = 0; for (int i_red = 0; i_red < ({red_extent}); ++i_red) if ({elem_c}) {{ __red = 1; break; }} __red; }})"
+                return f"({{ int __red = 1; for (int i_red = 0; i_red < ({red_extent}); ++i_red) if (!({elem_c})) {{ __red = 0; break; }} __red; }})"
         if nm in {"sum", "product"} and len(args) >= 1:
             arg0s = args[0].strip()
             m_empty_typed = re.match(r"^\[\s*(real|integer|double\s+precision|logical|complex|character(?:\s*\([^\]]*\))?|type\s*\(\s*[a-z_]\w*\s*\))\s*::\s*\]$", arg0s, re.IGNORECASE)
@@ -5535,15 +6066,19 @@ def _convert_expr(
                 continue
             if vv is not None and (vv.ctype or "").lower() == "char *" and not vv.is_array:
                 continue
-            out = re.sub(rf"(?<![\w*&])\b{re.escape(nm)}\b", f"*{nm}", out)
+            out = re.sub(rf"(?<!\(\*)(?<![\w&.>])\b{re.escape(nm)}\b", f"(*{nm})", out)
     for nm, vv in sorted(vars_map.items(), key=lambda kv: len(kv[0]), reverse=True):
         if vv.optional and (vv.ctype or "").lower() == "char *" and not vv.is_array:
-            out = re.sub(rf"(?<![\w*&])\b{re.escape(nm)}\b", f"*{nm}", out)
+            out = re.sub(rf"(?<!\(\*)(?<![\w&.>])\b{re.escape(nm)}\b", f"(*{nm})", out)
     # Keep present(...) lowering stable even when optional scalars are byref-dereferenced.
-    out = re.sub(r"\*\s*([a-z_]\w*)\s*!=\s*NULL", r"\1 != NULL", out, flags=re.IGNORECASE)
-    out = re.sub(r"NULL\s*!=\s*\*\s*([a-z_]\w*)", r"NULL != \1", out, flags=re.IGNORECASE)
-    out = re.sub(r"\*\s*([a-z_]\w*)\s*==\s*NULL", r"\1 == NULL", out, flags=re.IGNORECASE)
-    out = re.sub(r"NULL\s*==\s*\*\s*([a-z_]\w*)", r"NULL == \1", out, flags=re.IGNORECASE)
+    out = re.sub(r"\(\*\s*([a-z_]\w*)\s*\)\s*!=\s*NULL", r"\1 != NULL", out, flags=re.IGNORECASE)
+    out = re.sub(r"NULL\s*!=\s*\(\*\s*([a-z_]\w*)\s*\)", r"NULL != \1", out, flags=re.IGNORECASE)
+    out = re.sub(r"\(\*\s*([a-z_]\w*)\s*\)\s*==\s*NULL", r"\1 == NULL", out, flags=re.IGNORECASE)
+    out = re.sub(r"NULL\s*==\s*\(\*\s*([a-z_]\w*)\s*\)", r"NULL == \1", out, flags=re.IGNORECASE)
+    prev = None
+    while out != prev:
+        prev = out
+        out = re.sub(r"\(\*\s*\(\*\s*([a-z_]\w*)\s*\)\s*\)", r"(*\1)", out, flags=re.IGNORECASE)
     return out
 
 
@@ -5557,6 +6092,7 @@ def _parse_decls(
     body_line_nos: List[int] = list(unit.get("body_line_nos", []))
     source_lines: List[str] = list(unit.get("source_lines", []))
     type_ranges = _local_derived_type_index_ranges(unit) if local_derived_types else []
+    interface_depth = 0
     for idx, raw in enumerate(unit["body_lines"]):
         if local_derived_types and _index_in_ranges(idx, type_ranges):
             continue
@@ -5567,6 +6103,16 @@ def _parse_decls(
             if 1 <= ln <= len(source_lines):
                 inline_comment = _extract_fortran_comment(source_lines[ln - 1])
         if not code:
+            continue
+        low = code.lower()
+        if fscan.INTERFACE_START_RE.match(low):
+            interface_depth += 1
+            continue
+        if fscan.END_INTERFACE_RE.match(low):
+            if interface_depth > 0:
+                interface_depth -= 1
+            continue
+        if interface_depth > 0:
             continue
         is_optional = bool(re.search(r"(?i),\s*optional\b", code))
         code_no_opt = re.sub(r"(?i),\s*optional\b", "", code)
@@ -5905,26 +6451,28 @@ def _parse_decls(
                     vars_map[lhs.lower()] = Var("char *", init=init, intent=intent, is_param=is_param, is_allocatable=is_alloc, optional=is_optional, comment=inline_comment, char_len=char_len)
             continue
         if m_real or m_real_attr:
-            # Normalize group layout across the two accepted real-decl forms.
-            m_use = m_real if m_real is not None else m_real_attr
-            assert m_use is not None
-            if m_use.re.pattern.startswith("^real\\s*\\("):
-                kind_tok = (m_use.group(1) or "").strip().lower()
-                attrs = (m_use.group(2) or "").lower()
+            # Keep explicit-intent form distinct from the general attribute form,
+            # otherwise declarations like `real(dp), intent(inout) :: x` lose
+            # their intent because group 2 is the bare token `inout`.
+            if m_real is not None:
+                kind_tok = (m_real.group(1) or "").strip().lower()
+                intent = ((m_real.group(2) or "").replace(" ", "").lower() or None)
+                ents = m_real.group(3)
+                attrs = ""
+                is_external = False
+                is_alloc = False
+                dim_attr = None
+            else:
+                assert m_real_attr is not None
+                kind_tok = (m_real_attr.group(1) or "").strip().lower()
+                attrs = (m_real_attr.group(2) or "").lower()
                 m_intent = re.search(r"intent\s*\(\s*(in|out|inout)\s*\)", attrs, re.IGNORECASE)
                 intent = m_intent.group(1).lower() if m_intent else None
-                ents = m_use.group(3)
+                ents = m_real_attr.group(3)
                 is_external = "external" in attrs
                 is_alloc = "allocatable" in attrs
                 m_dim_attr = re.search(r"dimension\s*\(\s*([^)]+)\s*\)", attrs, re.IGNORECASE)
                 dim_attr = m_dim_attr.group(1).strip() if m_dim_attr else None
-            else:
-                kind_tok = (m_use.group(2) or "").strip().lower()
-                intent = m_use.group(1).lower() if m_use.group(1) else None
-                ents = m_use.group(3)
-                is_external = False
-                is_alloc = False
-                dim_attr = None
             kind_ct = real_type
             if kind_tok:
                 if kind_ctype_map and kind_tok in kind_ctype_map:
@@ -6023,6 +6571,8 @@ def _parse_decls(
                 ents = m_use.group(2)
                 is_external = False
                 is_alloc = False
+                is_param = False
+                is_save = False
                 dim_attr = None
             else:
                 attrs = (m_use.group(1) or "").lower()
@@ -6031,6 +6581,8 @@ def _parse_decls(
                 intent = m_intent.group(1).lower() if m_intent else None
                 is_external = "external" in attrs
                 is_alloc = "allocatable" in attrs
+                is_param = "parameter" in attrs
+                is_save = "save" in attrs
                 m_dim_attr = re.search(r"dimension\s*\(\s*([^)]+)\s*\)", attrs, re.IGNORECASE)
                 dim_attr = m_dim_attr.group(1).strip() if m_dim_attr else None
             for ent in [x.strip() for x in _split_args_top_level(ents) if x.strip()]:
@@ -6042,11 +6594,11 @@ def _parse_decls(
                 if ma:
                     nm = ma.group(1)
                     dim = ma.group(2).strip()
-                    vars_map[nm.lower()] = Var("int", is_array=True, dim=dim, is_logical=True, init=init, intent=intent, is_external=is_external, is_allocatable=is_alloc, optional=is_optional, comment=inline_comment)
+                    vars_map[nm.lower()] = Var("int", is_array=True, dim=dim, is_logical=True, init=init, intent=intent, is_external=is_external, is_allocatable=is_alloc, is_param=is_param, is_save=is_save, optional=is_optional, comment=inline_comment)
                 elif dim_attr:
-                    vars_map[lhs.lower()] = Var("int", is_array=True, dim=dim_attr, is_logical=True, init=init, intent=intent, is_external=is_external, is_allocatable=is_alloc, optional=is_optional, comment=inline_comment)
+                    vars_map[lhs.lower()] = Var("int", is_array=True, dim=dim_attr, is_logical=True, init=init, intent=intent, is_external=is_external, is_allocatable=is_alloc, is_param=is_param, is_save=is_save, optional=is_optional, comment=inline_comment)
                 else:
-                    vars_map[lhs.lower()] = Var("int", is_logical=True, init=init, intent=intent, is_external=is_external, is_allocatable=is_alloc, optional=is_optional, comment=inline_comment)
+                    vars_map[lhs.lower()] = Var("int", is_logical=True, init=init, intent=intent, is_external=is_external, is_allocatable=is_alloc, is_param=is_param, is_save=is_save, optional=is_optional, comment=inline_comment)
             continue
         if m_logical_no_colon and "::" not in code_no_opt:
             intent = m_logical_no_colon.group(1).lower() if m_logical_no_colon.group(1) else None
@@ -6308,7 +6860,8 @@ def _emit_decl(
 ) -> str:
     if as_arg:
         if v.is_external:
-            return f"{v.ctype} (*{nm})(...)"
+            sig = v.proc_sig or "..."
+            return f"{v.ctype} (*{nm})({sig})"
         if v.is_pointer and not v.is_array:
             return f"{v.ctype} *{nm}"
         if v.is_array:
@@ -6397,7 +6950,8 @@ def _emit_decl(
                 return f"{prefix}enum {{ {nm} = {val} }};"
         return f"{prefix}const {v.ctype} {nm} = {init};"
     if v.is_external:
-        return f"{prefix}{v.ctype} (*{nm})(...);"
+        sig = v.proc_sig or "..."
+        return f"{prefix}{v.ctype} (*{nm})({sig});"
         if v.init is not None:
             cinit = _convert_array_initializer(v.init, vars_map, real_type)
             if (v.dim or "").strip() in {"", "*"}:
@@ -8315,8 +8869,15 @@ def _transpile_unit(
         code = code_orig
         if not code:
             continue
+        stmt_label = ""
+        m_stmt_label = re.match(r"^(\d+)\s+(.+)$", code)
+        if m_stmt_label:
+            stmt_label = m_stmt_label.group(1)
+            code = m_stmt_label.group(2).strip()
         parsed_assoc = _split_leading_paren_group(code, "associate")
         if parsed_assoc:
+            if stmt_label:
+                out.append(" " * indent + f"xf2c_stmt_{stmt_label}: ;")
             binds = [x.strip() for x in _split_args_top_level(parsed_assoc[0]) if x.strip()]
             frame: Dict[str, str] = {}
             out.append(" " * indent + "{")
@@ -8387,6 +8948,8 @@ def _transpile_unit(
                 if cmt:
                     out.append(" " * indent + f"/* {cmt} */")
                     last_comment_lineno = ln
+        if stmt_label:
+            out.append(" " * indent + f"xf2c_stmt_{stmt_label}: ;")
 
         m_do = re.match(r"^(?:([a-z_]\w*)\s*:\s*)?do\s+([a-z_]\w*)\s*=\s*(.+)$", code, re.IGNORECASE)
         if m_do:
@@ -8621,13 +9184,22 @@ def _transpile_unit(
                 tgt_raw = items[0].strip()
                 tgt_c = _convert_expr(tgt_raw, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                 tgt_cty = _format_item_ctype(tgt_raw, vars_map, real_type)
+                src_cty = _format_item_ctype(unit_txt, vars_map, real_type)
                 helper = None
-                if tgt_cty == "int":
-                    helper = "read_first_int_s"
-                elif tgt_cty == "float":
-                    helper = "read_first_float_s"
+                if src_cty == "char *":
+                    if tgt_cty == "int":
+                        helper = "read_first_int_s"
+                    elif tgt_cty == "float":
+                        helper = "read_first_float_s"
+                    else:
+                        helper = "read_first_double_s"
                 else:
-                    helper = "read_first_double_s"
+                    if tgt_cty == "int":
+                        helper = "read_first_int_unit"
+                    elif tgt_cty == "float":
+                        helper = "read_first_float_unit"
+                    else:
+                        helper = "read_first_double_unit"
                 if iostat_txt:
                     out.append(" " * indent + f"{iostat_txt} = {helper}({src_c}, &({tgt_c}));")
                 else:
@@ -8722,6 +9294,12 @@ def _transpile_unit(
                 out.append(" " * indent + f"/* unsupported: {code} */")
             else:
                 out.append(" " * indent + f"goto {info['continue_label']};")
+            continue
+        m_goto = re.match(r"^(?:go\s+to|goto)\s+(\d+)\s*$", code, re.IGNORECASE)
+        if m_goto:
+            out.append(" " * indent + f"goto xf2c_stmt_{m_goto.group(1)};")
+            continue
+        if low == "continue":
             continue
         if low == "return":
             if unit["kind"] == "function":
@@ -9003,7 +9581,15 @@ def _transpile_unit(
         m_if_ret = re.match(r"^if\s*\((.+)\)\s*return\s*$", code, re.IGNORECASE)
         if m_if_ret:
             cond = _convert_expr(m_if_ret.group(1).strip(), vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
-            out.append(" " * indent + f"if ({cond}) return;")
+            if unit["kind"] == "function":
+                if unit.get("result"):
+                    out.append(" " * indent + f"if ({cond}) return {unit['result']};")
+                else:
+                    out.append(" " * indent + f"if ({cond}) return {implicit_result_name};")
+            elif unit["kind"] == "subroutine":
+                out.append(" " * indent + f"if ({cond}) return;")
+            else:
+                out.append(" " * indent + f"if ({cond}) return 0;")
             continue
         m_if_exit = re.match(r"^if\s*\((.+)\)\s*exit(?:\s+([a-z_]\w*))?\s*$", code, re.IGNORECASE)
         if m_if_exit:
@@ -9043,6 +9629,40 @@ def _transpile_unit(
                     _emit_error_stop_inline(code_arg, indent + 3)
                     out.append(" " * indent + "}")
                     continue
+                m_tail_stop = re.match(r"^stop(?:\s*\(\s*([^)]*)\s*\)|\s+(.+))?\s*$", tail, re.IGNORECASE)
+                if m_tail_stop:
+                    code_arg = (m_tail_stop.group(1) if m_tail_stop.group(1) is not None else m_tail_stop.group(2)) or ""
+                    code_arg = code_arg.strip()
+                    if not code_arg:
+                        c_stop = "0"
+                    else:
+                        if (code_arg.startswith('"') and code_arg.endswith('"')) or (code_arg.startswith("'") and code_arg.endswith("'")):
+                            c_stop = "1"
+                        else:
+                            c_stop = _convert_expr(code_arg, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                    if unit["kind"] == "program":
+                        out.append(" " * indent + f"if ({cond}) return {c_stop};")
+                    else:
+                        out.append(" " * indent + f"if ({cond}) return;")
+                    continue
+                m_tail_goto = re.match(r"^(?:go\s+to|goto)\s+(\d+)\s*$", tail, re.IGNORECASE)
+                if m_tail_goto:
+                    out.append(" " * indent + f"if ({cond}) goto xf2c_stmt_{m_tail_goto.group(1)};")
+                    continue
+                parsed_tail_close = _split_leading_paren_group(tail, "close")
+                if parsed_tail_close:
+                    ctl = parsed_tail_close[0].strip()
+                    ctl_items = [x.strip() for x in _split_args_top_level(ctl) if x.strip()]
+                    unit_txt = ctl_items[0] if ctl_items else None
+                    for ctl_item in ctl_items:
+                        m_kw = re.match(r"(?i)^unit\s*=\s*(.+)$", ctl_item)
+                        if m_kw:
+                            unit_txt = m_kw.group(1).strip()
+                            break
+                    if unit_txt is not None:
+                        unit_c = _convert_expr(unit_txt, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                        out.append(" " * indent + f"if ({cond}) close_unit({unit_c});")
+                        continue
                 if m_tail_asn:
                     lhs_raw = m_tail_asn.group(1).strip()
                     rhs_raw = m_tail_asn.group(2).strip()
@@ -9070,9 +9690,23 @@ def _transpile_unit(
                             lo = _convert_expr(lo_raw, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                             hi = _convert_expr(hi_raw, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                             st = _convert_expr(st_raw, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                            rhs_view = _rewrite_rank1_view_expr(
+                                rhs_raw,
+                                "p_fill",
+                                vars_map,
+                                real_type,
+                                byref_scalars,
+                                assumed_extents,
+                                proc_arg_extent_names,
+                            )
                             out.append(" " * indent + f"if ({cond}) {{")
-                            out.append(" " * (indent + 3) + f"for (int i_fill = {lo}; ({st}) > 0 ? i_fill <= {hi} : i_fill >= {hi}; i_fill += {st}) {{")
-                            out.append(" " * (indent + 6) + f"{lhs_nm}[i_fill - 1] = {rhs};")
+                            if rhs_view is not None:
+                                rhs_elem, rhs_extent, _ = rhs_view
+                                out.append(" " * (indent + 3) + f"for (int i_fill = {lo}, p_fill = 0; p_fill < ({rhs_extent}); i_fill += {st}, ++p_fill) {{")
+                                out.append(" " * (indent + 6) + f"{lhs_nm}[i_fill - 1] = {rhs_elem};")
+                            else:
+                                out.append(" " * (indent + 3) + f"for (int i_fill = {lo}; ({st}) > 0 ? i_fill <= {hi} : i_fill >= {hi}; i_fill += {st}) {{")
+                                out.append(" " * (indent + 6) + f"{lhs_nm}[i_fill - 1] = {rhs};")
                             out.append(" " * (indent + 3) + "}")
                             out.append(" " * indent + "}")
                             continue
@@ -9102,8 +9736,9 @@ def _transpile_unit(
                     out.append(" " * indent + f"if ({cond}) {lhs} = {rhs};")
                     continue
                 if m_tail_call:
-                    callee = m_tail_call.group(1)
+                    raw_callee = m_tail_call.group(1)
                     fargs = _split_args_top_level(m_tail_call.group(2).strip()) if m_tail_call.group(2).strip() else []
+                    callee = _resolve_generic_proc_name(raw_callee, fargs, vars_map, real_type)
                     fargs = _normalize_actual_args(callee, fargs, proc_arg_names)
                     modes = proc_arg_modes.get(callee.lower(), [])
                     opts = proc_arg_optional.get(callee.lower(), [])
@@ -9127,6 +9762,7 @@ def _transpile_unit(
                             exts,
                             vars_map,
                             real_type,
+                            ctypes[k] if k < len(ctypes) else None,
                             byref_scalars,
                             assumed_extents,
                             proc_arg_extent_names,
@@ -9177,8 +9813,9 @@ def _transpile_unit(
             continue
         m_call = re.match(r"^call\s+([a-z_]\w*)\s*\((.*)\)\s*$", code, re.IGNORECASE)
         if m_call:
-            callee = m_call.group(1)
+            raw_callee = m_call.group(1)
             fargs = _split_args_top_level(m_call.group(2).strip()) if m_call.group(2).strip() else []
+            callee = _resolve_generic_proc_name(raw_callee, fargs, vars_map, real_type)
             fargs = _normalize_actual_args(callee, fargs, proc_arg_names)
             if callee.lower() == "move_alloc" and len(fargs) >= 2:
                 src_raw = fargs[0].strip()
@@ -9331,6 +9968,7 @@ def _transpile_unit(
                     exts,
                     vars_map,
                     real_type,
+                    ctypes[k] if k < len(ctypes) else None,
                     byref_scalars,
                     assumed_extents,
                     proc_arg_extent_names,
@@ -9351,6 +9989,9 @@ def _transpile_unit(
                         cargs.append(cexpr)
                 else:
                     if cexpr.lstrip().startswith("&"):
+                        cargs.append(cexpr)
+                        continue
+                    if arrk and re.match(r"^\s*\(\([^)]*\[\]\)\{", cexpr):
                         cargs.append(cexpr)
                         continue
                     m_id = re.match(r"^\s*([a-z_]\w*)\s*$", a, re.IGNORECASE)
@@ -9380,6 +10021,8 @@ def _transpile_unit(
                             cargs.append(f"&(({cty}){{{cexpr}}})" if opt and (not arrk) else f"&({cexpr})")
                     else:
                         if arrk and cexpr.lstrip().startswith("&"):
+                            cargs.append(cexpr)
+                        elif arrk and re.match(r"^\s*\(\([^)]*\[\]\)\{", cexpr):
                             cargs.append(cexpr)
                         else:
                             cargs.append(f"&(({cty}){{{cexpr}}})" if opt and (not arrk) else f"&({cexpr})")
@@ -9438,6 +10081,17 @@ def _transpile_unit(
             if not items:
                 out.append(" " * indent + 'printf("\\n");')
                 continue
+            if _emit_list_directed_loc_intrinsic(
+                out,
+                indent,
+                items,
+                vars_map,
+                real_type,
+                byref_scalars,
+                assumed_extents,
+                proc_arg_extent_names,
+            ):
+                continue
             scalar_only = True
             scalar_parts: List[tuple[str, str]] = []
             for pit in items:
@@ -9482,17 +10136,6 @@ def _transpile_unit(
             if not items:
                 out.append(" " * indent + 'printf("\\n");')
                 continue
-            if _emit_list_directed_loc_intrinsic(
-                out,
-                indent,
-                items,
-                vars_map,
-                real_type,
-                byref_scalars,
-                assumed_extents,
-                proc_arg_extent_names,
-            ):
-                continue
             if len(items) == 1:
                 m_minmax_print = re.match(r"^(minval|maxval)\s*\((.*)\)\s*$", items[0], re.IGNORECASE)
                 if m_minmax_print:
@@ -9518,7 +10161,8 @@ def _transpile_unit(
             early_intr_supported = True
             early_saw_intr = False
             for pit in items:
-                m_intr_early = re.match(r"^(size|rank|shape|lbound|ubound)\s*\((.*)\)\s*$", pit, re.IGNORECASE)
+                pit_s = pit.strip()
+                m_intr_early = re.match(r"^(size|rank|shape|lbound|ubound|minloc|maxloc|findloc)\s*\((.*)\)\s*$", pit_s, re.IGNORECASE)
                 if m_intr_early:
                     early_saw_intr = True
                     vals_early = _shape_like_intrinsic_values(
@@ -9535,6 +10179,9 @@ def _transpile_unit(
                         break
                     for vv_early in vals_early:
                         early_intr_items.append(("int", vv_early))
+                    continue
+                if _is_fortran_string_literal(pit_s):
+                    early_intr_items.append(("string", pit_s))
                     continue
                 for tok in re.findall(r"\b[a-z_]\w*\b", _strip_comment(pit), flags=re.IGNORECASE):
                     vv_tok = vars_map.get(tok.lower())
@@ -9663,6 +10310,54 @@ def _transpile_unit(
                         out.append(" " * indent + "}")
                         continue
                 if len(items) >= 2:
+                    loc_mixed_parts: List[tuple[str, str]] = []
+                    loc_mixed_supported = True
+                    loc_mixed_saw = False
+                    for pit in items:
+                        pit_s = pit.strip()
+                        if _is_fortran_string_literal(pit_s):
+                            lit = _unquote_fortran_string_literal(pit_s).replace("\\", "\\\\").replace('"', '\\"')
+                            loc_mixed_parts.append(("string", f'"{lit}"'))
+                            continue
+                        m_loc_mix = re.match(r"^(minloc|maxloc|findloc)\s*\((.*)\)\s*$", pit_s, re.IGNORECASE)
+                        if m_loc_mix:
+                            loc_mixed_saw = True
+                            vals_loc = _shape_like_intrinsic_values(
+                                m_loc_mix.group(1).lower(),
+                                [x.strip() for x in _split_args_top_level(m_loc_mix.group(2)) if x.strip()],
+                                vars_map,
+                                real_type,
+                                byref_scalars,
+                                assumed_extents,
+                                proc_arg_extent_names,
+                            )
+                            if vals_loc is None:
+                                loc_mixed_supported = False
+                                break
+                            loc_mixed_parts.extend(("int", vv) for vv in vals_loc)
+                            continue
+                        cty_p = _format_item_ctype(pit, vars_map, real_type)
+                        cexpr_p = _convert_expr(pit, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                        loc_mixed_parts.append((cty_p, cexpr_p))
+                    if loc_mixed_saw and loc_mixed_supported and loc_mixed_parts:
+                        out.append(" " * indent + "{")
+                        out.append(" " * (indent + 3) + "int __first = 1;")
+                        all_string_like = all(cty_p in {"string", "trim_string"} for cty_p, _ in loc_mixed_parts)
+                        sep_expr = '""' if all_string_like else '" "'
+                        for cty_p, cexpr_p in loc_mixed_parts:
+                            _emit_list_directed_scalar_printf(
+                                out,
+                                indent + 3,
+                                cexpr_p,
+                                cty_p,
+                                vars_map,
+                                real_type,
+                                prefix_expr=f'__first ? "" : {sep_expr}',
+                            )
+                            out.append(" " * (indent + 3) + "__first = 0;")
+                        out.append(" " * (indent + 3) + 'printf("\\n");')
+                        out.append(" " * indent + "}")
+                        continue
                     mixed_parts: List[tuple[str, str]] = []
                     mixed_supported = True
                     for pit in items:
@@ -9675,7 +10370,8 @@ def _transpile_unit(
                             nm_trim = m_trim.group(1).lower()
                             mixed_parts.append(("trim_string", nm_trim))
                             continue
-                        m_intr_mix = re.match(r"^(size|rank|shape|lbound|ubound)\s*\((.*)\)\s*$", pit, re.IGNORECASE)
+                        pit_s = pit.strip()
+                        m_intr_mix = re.match(r"^(size|rank|shape|lbound|ubound|minloc|maxloc|findloc)\s*\((.*)\)\s*$", pit_s, re.IGNORECASE)
                         if m_intr_mix:
                             inm = m_intr_mix.group(1).lower()
                             iargs = [x.strip() for x in _split_args_top_level(m_intr_mix.group(2)) if x.strip()]
@@ -9892,6 +10588,54 @@ def _transpile_unit(
                         scalar_only = False
                         break
                 if scalar_only:
+                    loc_scalar_parts: List[tuple[str, str]] = []
+                    loc_scalar_supported = True
+                    loc_scalar_saw = False
+                    for it in items:
+                        it_s = it.strip()
+                        if _is_fortran_string_literal(it_s):
+                            lit = _unquote_fortran_string_literal(it_s).replace("\\", "\\\\").replace('"', '\\"')
+                            loc_scalar_parts.append(("string", f'"{lit}"'))
+                            continue
+                        m_loc_scalar = re.match(r"^(minloc|maxloc|findloc)\s*\((.*)\)\s*$", it_s, re.IGNORECASE)
+                        if m_loc_scalar:
+                            loc_scalar_saw = True
+                            vals_loc = _shape_like_intrinsic_values(
+                                m_loc_scalar.group(1).lower(),
+                                [x.strip() for x in _split_args_top_level(m_loc_scalar.group(2)) if x.strip()],
+                                vars_map,
+                                real_type,
+                                byref_scalars,
+                                assumed_extents,
+                                proc_arg_extent_names,
+                            )
+                            if vals_loc is None:
+                                loc_scalar_supported = False
+                                break
+                            loc_scalar_parts.extend(("int", vv) for vv in vals_loc)
+                            continue
+                        cty = _format_item_ctype(it, vars_map, real_type)
+                        cexpr = _convert_expr(it, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                        loc_scalar_parts.append((cty, cexpr))
+                    if loc_scalar_saw and loc_scalar_supported:
+                        out.append(" " * indent + "{")
+                        out.append(" " * (indent + 3) + "int __first = 1;")
+                        all_string_like = all(cty_p in {"string", "trim_string"} for cty_p, _ in loc_scalar_parts)
+                        sep_expr = '""' if all_string_like else '" "'
+                        for cty_p, cexpr_p in loc_scalar_parts:
+                            _emit_list_directed_scalar_printf(
+                                out,
+                                indent + 3,
+                                cexpr_p,
+                                cty_p,
+                                vars_map,
+                                real_type,
+                                prefix_expr=f'__first ? "" : {sep_expr}',
+                            )
+                            out.append(" " * (indent + 3) + "__first = 0;")
+                        out.append(" " * (indent + 3) + 'printf("\\n");')
+                        out.append(" " * indent + "}")
+                        continue
                     fmts: List[str] = []
                     cargs: List[str] = []
                     ctypes_ld: List[str] = []
@@ -10803,6 +11547,7 @@ def _transpile_unit(
                             cargs0: List[str] = []
                             out_len0: Optional[str] = None
                             extent_lists0 = proc_arg_extent_names.get(callee0, [])
+                            ctypes0 = proc_arg_ctypes.get(callee0, [])
                             for k0, a0 in enumerate(raw_args0):
                                 exts0 = extent_lists0[k0] if k0 < len(extent_lists0) else []
                                 extent_args0, carg0 = _expand_assumed_shape_actual_arg(
@@ -10810,6 +11555,7 @@ def _transpile_unit(
                                     exts0,
                                     vars_map,
                                     real_type,
+                                    ctypes0[k0] if k0 < len(ctypes0) else None,
                                     byref_scalars,
                                     assumed_extents,
                                     proc_arg_extent_names,
@@ -10875,6 +11621,7 @@ def _transpile_unit(
                                 cargs: List[str] = []
                                 out_len: Optional[str] = None
                                 extent_lists = proc_arg_extent_names.get(callee_arr, [])
+                                ctypes_arr = proc_arg_ctypes.get(callee_arr, [])
                                 for k, a_raw in enumerate(raw_args):
                                     exts = extent_lists[k] if k < len(extent_lists) else []
                                     extent_args, carg = _expand_assumed_shape_actual_arg(
@@ -10882,6 +11629,7 @@ def _transpile_unit(
                                         exts,
                                         vars_map,
                                         real_type,
+                                        ctypes_arr[k] if k < len(ctypes_arr) else None,
                                         byref_scalars,
                                         assumed_extents,
                                         proc_arg_extent_names,
@@ -11261,6 +12009,22 @@ def _transpile_unit(
                         fmt_txt = val
             unit_norm = unit_txt.strip().lower() if unit_txt is not None else ""
             write_to_stdout = unit_norm == "*" or unit_norm in stdout_unit_names or ctl.startswith("*")
+            if (not write_to_stdout) and fmt_txt is not None and fmt_txt.strip() == "*":
+                tail_file = tail[1:].strip() if tail.startswith(",") else tail
+                items_file = [x.strip() for x in _split_args_top_level(tail_file) if x.strip()]
+                if unit_txt is not None and len(items_file) == 1:
+                    unit_c = _convert_expr(unit_txt, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                    arg_c = _convert_expr(items_file[0], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                    arg_ty = _format_item_ctype(items_file[0], vars_map, real_type)
+                    if arg_ty == "int":
+                        out.append(" " * indent + f"if (write_first_int_unit({unit_c}, {arg_c}) != 0) {fail_stmt}")
+                        continue
+                    if arg_ty == "float":
+                        out.append(" " * indent + f"if (write_first_float_unit({unit_c}, {arg_c}) != 0) {fail_stmt}")
+                        continue
+                    if arg_ty == "double":
+                        out.append(" " * indent + f"if (write_first_double_unit({unit_c}, {arg_c}) != 0) {fail_stmt}")
+                        continue
             if (not write_to_stdout) and fmt_txt is not None and _is_fortran_string_literal(fmt_txt):
                 fmt_clean = _unquote_fortran_string_literal(fmt_txt).strip().lower()
                 tail_file = tail[1:].strip() if tail.startswith(",") else tail
@@ -11298,6 +12062,19 @@ def _transpile_unit(
                     arg_c = _convert_expr(items_file[0], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                     out.append(" " * indent + f"write_a({unit_c}, {arg_c});")
                     continue
+                if fmt_clean == '*' and len(items_file) == 1 and unit_txt is not None:
+                    unit_c = _convert_expr(unit_txt, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                    arg_c = _convert_expr(items_file[0], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                    arg_ty = _format_item_ctype(items_file[0], vars_map, real_type)
+                    if arg_ty == "int":
+                        out.append(" " * indent + f"if (write_first_int_unit({unit_c}, {arg_c}) != 0) {fail_stmt}")
+                        continue
+                    if arg_ty == "float":
+                        out.append(" " * indent + f"if (write_first_float_unit({unit_c}, {arg_c}) != 0) {fail_stmt}")
+                        continue
+                    if arg_ty == "double":
+                        out.append(" " * indent + f"if (write_first_double_unit({unit_c}, {arg_c}) != 0) {fail_stmt}")
+                        continue
             if (not write_to_stdout) and fmt_txt is None:
                 tail_file = tail[1:].strip() if tail.startswith(",") else tail
                 items_file = [x.strip() for x in _split_args_top_level(tail_file) if x.strip()]
@@ -11914,6 +12691,19 @@ def _transpile_unit(
             rhs_raw = m_asn.group(2).strip()
             if use_implicit_result and lhs_raw.lower() == unit_name_l:
                 lhs_raw = implicit_result_name
+            if _emit_loc_assignment(
+                out,
+                indent,
+                lhs_raw,
+                rhs_raw,
+                vars_map,
+                real_type,
+                fail_stmt,
+                byref_scalars,
+                assumed_extents,
+                proc_arg_extent_names,
+            ):
+                continue
             m_lhs_col_runif = re.match(r"^([a-z_]\w*)\s*\(\s*:\s*,\s*([^)]+)\s*\)\s*$", lhs_raw, re.IGNORECASE)
             m_lhs_runif = re.match(r"^([a-z_]\w*)$", lhs_raw, re.IGNORECASE)
             m_rhs_runif_1d = re.match(r"^runif_1d\s*\(\s*(.+)\s*\)\s*$", rhs_raw, re.IGNORECASE)
@@ -12271,6 +13061,15 @@ def _transpile_unit(
                     row = _convert_expr((m_lhs_row.group(2) or "").strip(), vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                     ncol = _convert_expr(dparts2[1], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                     d1 = _convert_expr(dparts2[0], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                    ctor_items = _array_constructor_items(rhs_raw)
+                    if ctor_items is not None:
+                        ctor_vals = [
+                            _convert_expr(it, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                            for it in ctor_items
+                        ]
+                        for k, cv in enumerate(ctor_vals):
+                            out.append(" " * indent + f"{lhs_nm_sec}[(({row}) - 1) + ({d1}) * {k}] = {cv};")
+                        continue
                     rhs_view = _rewrite_rank1_view_expr(
                         rhs_raw,
                         "p_fill",
@@ -12297,6 +13096,15 @@ def _transpile_unit(
                     col = _convert_expr((m_lhs_col.group(2) or "").strip(), vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                     nrow = _convert_expr(dparts2[0], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                     d1 = _convert_expr(dparts2[0], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                    ctor_items = _array_constructor_items(rhs_raw)
+                    if ctor_items is not None:
+                        ctor_vals = [
+                            _convert_expr(it, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                            for it in ctor_items
+                        ]
+                        for k, cv in enumerate(ctor_vals):
+                            out.append(" " * indent + f"{lhs_nm_sec}[{k} + ({d1}) * ((({col}) - 1))] = {cv};")
+                        continue
                     rhs_view = _rewrite_rank1_view_expr(
                         rhs_raw,
                         "p_fill",
@@ -12359,6 +13167,71 @@ def _transpile_unit(
                         out.append(" " * (indent + 3) + f"{lhs_nm_sec}[{lhs_idx}] = {rhs};")
                         out.append(" " * indent + "}")
                         continue
+            m_lhs_col_sec = re.match(
+                r"^([a-z_]\w*)\s*\(\s*([^:,\)]*)\s*:\s*([^:,\)]*)(?:\s*:\s*([^)]+))?\s*,\s*([^,()]+)\s*\)$",
+                lhs_raw,
+                re.IGNORECASE,
+            )
+            if m_lhs_col_sec:
+                lhs_nm_sec = m_lhs_col_sec.group(1).lower()
+                lv_sec = vars_map.get(lhs_nm_sec)
+                if lv_sec is not None and lv_sec.is_array and len(_dim_parts(lv_sec.dim)) == 2:
+                    dparts2 = _resolved_dim_parts(lv_sec, lhs_nm_sec, assumed_extents)
+                    sp = [
+                        (m_lhs_col_sec.group(2) or "").strip(),
+                        (m_lhs_col_sec.group(3) or "").strip(),
+                        (m_lhs_col_sec.group(4) or "").strip(),
+                    ]
+                    col_expr = _convert_expr((m_lhs_col_sec.group(5) or "").strip(), vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                    base_lo = _dim_lb_expr(dparts2[0], vars_map, real_type, byref_scalars, assumed_extents)
+                    base_ext = _dim_extent_expr(dparts2[0], vars_map, real_type, byref_scalars, assumed_extents)
+                    base_hi = f"(({base_lo}) + ({base_ext}) - 1)"
+                    lo = _convert_expr(sp[0] or base_lo, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                    hi = _convert_expr(sp[1] or base_hi, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                    st = _convert_expr(sp[2] or "1", vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                    rhs_view = _rewrite_rank1_view_expr(
+                        rhs_raw,
+                        "p_fill",
+                        vars_map,
+                        real_type,
+                        byref_scalars,
+                        assumed_extents,
+                        proc_arg_extent_names,
+                    )
+                    if rhs_view is not None:
+                        rhs, _, _ = rhs_view
+                        lhs_idx = _fortran_sub_to_linear(
+                            [f"(({lo}) + (p_fill * ({st})))", col_expr],
+                            dparts2,
+                            vars_map,
+                            real_type,
+                            byref_scalars,
+                            assumed_extents,
+                        )
+                        out.append(" " * indent + f"for (int p_fill = 0; p_fill < {_section_count_expr(lo, hi, st)}; ++p_fill) {{")
+                        out.append(" " * (indent + 3) + f"{lhs_nm_sec}[{lhs_idx}] = {rhs};")
+                        out.append(" " * indent + "}")
+                        continue
+                    rhs = _convert_expr(
+                        rhs_raw,
+                        vars_map,
+                        real_type,
+                        byref_scalars,
+                        assumed_extents,
+                        proc_arg_extent_names,
+                    )
+                    lhs_idx = _fortran_sub_to_linear(
+                        [f"(({lo}) + (p_fill * ({st})))", col_expr],
+                        dparts2,
+                        vars_map,
+                        real_type,
+                        byref_scalars,
+                        assumed_extents,
+                    )
+                    out.append(" " * indent + f"for (int p_fill = 0; p_fill < {_section_count_expr(lo, hi, st)}; ++p_fill) {{")
+                    out.append(" " * (indent + 3) + f"{lhs_nm_sec}[{lhs_idx}] = {rhs};")
+                    out.append(" " * indent + "}")
+                    continue
             m_lhs_sec = re.match(
                 r"^([a-z_]\w*)\s*\(\s*([^:,\)]*)\s*:\s*([^:,\)]*)(?:\s*:\s*([^)]+))?\s*\)$",
                 lhs_raw,
@@ -12375,6 +13248,43 @@ def _transpile_unit(
                     lo = _convert_expr(lo_raw, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                     hi = _convert_expr(hi_raw, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
                     st = _convert_expr(st_raw, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                    rhs_view = _rewrite_rank1_view_expr(
+                        rhs_raw,
+                        "p_fill",
+                        vars_map,
+                        real_type,
+                        byref_scalars,
+                        assumed_extents,
+                        proc_arg_extent_names,
+                    )
+                    if rhs_view is not None:
+                        rhs, rhs_extent, _ = rhs_view
+                        out.append(" " * indent + f"if ({st} > 0) {{")
+                        out.append(" " * (indent + 3) + f"for (int i_fill = {lo}, p_fill = 0; p_fill < ({rhs_extent}); i_fill += {st}, ++p_fill) {{")
+                        if (lv_sec.ctype or "").lower() == "char *":
+                            if lv_sec.is_allocatable or _is_assumed_shape(lv_sec.dim):
+                                out.append(" " * (indent + 6) + f"assign_str_alloc(&{lhs_nm_sec}[i_fill - 1], {rhs});")
+                            elif lv_sec.char_len:
+                                out.append(" " * (indent + 6) + f"assign_str({lhs_nm_sec}[i_fill - 1], {_simplify_int_expr_text(lv_sec.char_len)}, {rhs});")
+                            else:
+                                out.append(" " * (indent + 6) + f"assign_str_alloc(&{lhs_nm_sec}[i_fill - 1], {rhs});")
+                        else:
+                            out.append(" " * (indent + 6) + f"{lhs_nm_sec}[i_fill - 1] = {rhs};")
+                        out.append(" " * (indent + 3) + "}")
+                        out.append(" " * indent + "} else {")
+                        out.append(" " * (indent + 3) + f"for (int i_fill = {lo}, p_fill = 0; p_fill < ({rhs_extent}); i_fill += {st}, ++p_fill) {{")
+                        if (lv_sec.ctype or "").lower() == "char *":
+                            if lv_sec.is_allocatable or _is_assumed_shape(lv_sec.dim):
+                                out.append(" " * (indent + 6) + f"assign_str_alloc(&{lhs_nm_sec}[i_fill - 1], {rhs});")
+                            elif lv_sec.char_len:
+                                out.append(" " * (indent + 6) + f"assign_str({lhs_nm_sec}[i_fill - 1], {_simplify_int_expr_text(lv_sec.char_len)}, {rhs});")
+                            else:
+                                out.append(" " * (indent + 6) + f"assign_str_alloc(&{lhs_nm_sec}[i_fill - 1], {rhs});")
+                        else:
+                            out.append(" " * (indent + 6) + f"{lhs_nm_sec}[i_fill - 1] = {rhs};")
+                        out.append(" " * (indent + 3) + "}")
+                        out.append(" " * indent + "}")
+                        continue
                     rhs_scan = _strip_comment(rhs_raw)
                     rhs_tokens = {t.lower() for t in re.findall(r"\b[a-z_]\w*\b", rhs_scan, flags=re.IGNORECASE)}
 
@@ -12600,6 +13510,7 @@ def _transpile_unit(
                             raw_args = _normalize_actual_args(callee, raw_args, proc_arg_names)
                             cargs: List[str] = []
                             extent_lists = proc_arg_extent_names.get(callee, [])
+                            ctypes_call = proc_arg_ctypes.get(callee, [])
                             rv = _proc_result_var(callee) or lv_arr
                             for k, a in enumerate(raw_args):
                                 exts = extent_lists[k] if k < len(extent_lists) else []
@@ -12608,6 +13519,7 @@ def _transpile_unit(
                                     exts,
                                     vars_map,
                                     real_type,
+                                    ctypes_call[k] if k < len(ctypes_call) else None,
                                     byref_scalars,
                                     assumed_extents,
                                     proc_arg_extent_names,
@@ -13014,6 +13926,7 @@ def _transpile_unit(
                     raw_args = _normalize_actual_args(callee, raw_args, proc_arg_names)
                     cargs: List[str] = []
                     extent_lists = proc_arg_extent_names.get(callee, [])
+                    ctypes_call = proc_arg_ctypes.get(callee, [])
                     rv = _proc_result_var(callee) or lv
                     for k, a in enumerate(raw_args):
                         exts = extent_lists[k] if k < len(extent_lists) else []
@@ -13022,6 +13935,7 @@ def _transpile_unit(
                             exts,
                             vars_map,
                             real_type,
+                            ctypes_call[k] if k < len(ctypes_call) else None,
                             byref_scalars,
                             assumed_extents,
                             proc_arg_extent_names,
@@ -13296,15 +14210,46 @@ def _extract_module_parameter_maps(
 
 def _imported_module_parameters_for_unit(
     unit: Dict[str, object],
+    units: List[Dict[str, object]],
     module_param_maps: Dict[str, Dict[str, Var]],
     proc_parent_module: Dict[str, str],
+    real_type: str,
+    kind_ctype_map: Dict[str, str],
 ) -> Dict[str, Var]:
-    """Return module PARAMETERs visible in a unit via containment or USE."""
+    """Return PARAMETERs visible in a unit via host association or USE."""
     imported: Dict[str, Var] = {}
     unit_name = str(unit.get("name", "")).lower()
     parent_mod = proc_parent_module.get(unit_name)
     if parent_mod and parent_mod in module_param_maps:
         imported.update(dict(module_param_maps[parent_mod]))
+    header_line = int(unit.get("header_line_no", 0))
+    host_unit: Optional[Dict[str, object]] = None
+    for cand in units:
+        if cand is unit:
+            continue
+        cand_header = int(cand.get("header_line_no", 0))
+        cand_end = int(cand.get("end_line_no", 0))
+        cand_contains = cand.get("contains_line_no")
+        if cand_header < header_line <= cand_end and cand_contains and int(cand_contains) < header_line:
+            if host_unit is None or cand_header > int(host_unit.get("header_line_no", 0)):
+                host_unit = cand
+    while host_unit is not None:
+        parsed = _parse_decls(host_unit, real_type, kind_ctype_map)
+        for nm, vv in parsed.items():
+            if vv.is_param and nm not in imported:
+                imported[nm] = vv
+        parent_host: Optional[Dict[str, object]] = None
+        host_header = int(host_unit.get("header_line_no", 0))
+        for cand in units:
+            if cand is host_unit:
+                continue
+            cand_header = int(cand.get("header_line_no", 0))
+            cand_end = int(cand.get("end_line_no", 0))
+            cand_contains = cand.get("contains_line_no")
+            if cand_header < host_header <= cand_end and cand_contains and int(cand_contains) < host_header:
+                if parent_host is None or cand_header > int(parent_host.get("header_line_no", 0)):
+                    parent_host = cand
+        host_unit = parent_host
     for raw in unit.get("body_lines", []):
         code = _strip_comment(str(raw)).strip()
         m_use = re.match(r"^use\s+([a-z_]\w*)\b(?:\s*,\s*only\s*:\s*(.*))?$", code, re.IGNORECASE)
@@ -13334,6 +14279,143 @@ def _imported_module_parameters_for_unit(
                 imported[nm] = params[nm]
     return imported
 
+
+def _local_interface_proc_kinds(unit: Dict[str, object]) -> Dict[str, str]:
+    kinds: Dict[str, str] = {}
+    depth = 0
+    for raw in unit.get("body_lines", []):
+        code = _strip_comment(str(raw)).strip()
+        if not code:
+            continue
+        low = code.lower()
+        if fscan.INTERFACE_START_RE.match(low):
+            depth += 1
+            continue
+        if fscan.END_INTERFACE_RE.match(low):
+            if depth > 0:
+                depth -= 1
+            continue
+        if depth <= 0:
+            continue
+        m_sub = re.match(r"^(?:(?:pure|elemental|impure|recursive|module)\s+)*subroutine\s+([a-z_]\w*)\b", low)
+        if m_sub:
+            kinds[m_sub.group(1).lower()] = "subroutine"
+            continue
+        m_fun = re.match(
+            r"^(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|double\s+precision)\s+)?function\s+([a-z_]\w*)\b",
+            low,
+            re.IGNORECASE,
+        )
+        if m_fun:
+            kinds[m_fun.group(1).lower()] = "function"
+    return kinds
+
+
+def _local_interface_proc_signatures(
+    unit: Dict[str, object],
+    real_type: str,
+    kind_ctype_map: Dict[str, str],
+) -> Dict[str, tuple[str, str]]:
+    sigs: Dict[str, tuple[str, str]] = {}
+    depth = 0
+    current: Optional[Dict[str, object]] = None
+    for raw in unit.get("body_lines", []):
+        code = _strip_comment(str(raw)).strip()
+        if not code:
+            continue
+        low = code.lower()
+        if fscan.INTERFACE_START_RE.match(low):
+            depth += 1
+            continue
+        if fscan.END_INTERFACE_RE.match(low):
+            if depth > 0:
+                depth -= 1
+            continue
+        if depth <= 0:
+            continue
+        if current is None:
+            m_sub = re.match(
+                r"^(?:(?:pure|elemental|impure|recursive|module)\s+)*subroutine\s+([a-z_]\w*)\s*(?:\(([^)]*)\))?",
+                code,
+                re.IGNORECASE,
+            )
+            if m_sub:
+                args = [x.strip() for x in (m_sub.group(2) or "").split(",") if x.strip()]
+                current = {
+                    "kind": "subroutine",
+                    "name": m_sub.group(1),
+                    "args": args,
+                    "result": None,
+                    "body_lines": [],
+                    "body_line_nos": [],
+                    "source_lines": [],
+                }
+                continue
+            m_fun = re.match(
+                r"^(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|double\s+precision)\s+)?function\s+([a-z_]\w*)\s*(?:\(([^)]*)\))?(?:\s*result\s*\(\s*([a-z_]\w*)\s*\))?",
+                code,
+                re.IGNORECASE,
+            )
+            if m_fun:
+                args = [x.strip() for x in (m_fun.group(2) or "").split(",") if x.strip()]
+                current = {
+                    "kind": "function",
+                    "name": m_fun.group(1),
+                    "args": args,
+                    "result": m_fun.group(3),
+                    "body_lines": [],
+                    "body_line_nos": [],
+                    "source_lines": [],
+                }
+                continue
+        assert current is not None
+        end_pat = (
+            r"^end\s+subroutine\b"
+            if current["kind"] == "subroutine"
+            else r"^end\s+function\b"
+        )
+        if re.match(end_pat, low, re.IGNORECASE):
+            vmap = _parse_decls(current, real_type, kind_ctype_map)
+            arg_names_lower = [str(a).lower() for a in current.get("args", [])]
+            assumed_rank1_count = 0
+            for a_l in arg_names_lower:
+                av0 = vmap.get(a_l, Var("int"))
+                if (
+                    av0.is_array
+                    and _is_assumed_shape(av0.dim)
+                    and (not av0.is_allocatable)
+                    and (not av0.is_pointer)
+                    and max(1, len(_dim_parts(av0.dim))) == 1
+                ):
+                    assumed_rank1_count += 1
+            args_decl: List[str] = []
+            for a in current.get("args", []):
+                a_l = str(a).lower()
+                av = vmap.get(a_l, Var("int"))
+                if av.is_array and _is_assumed_shape(av.dim) and (not av.is_allocatable) and (not av.is_pointer):
+                    rank = max(1, len(_dim_parts(av.dim)))
+                    use_simple_n = (
+                        rank == 1
+                        and assumed_rank1_count == 1
+                        and "n" not in arg_names_lower
+                        and "n" not in vmap
+                    )
+                    exts = _extent_param_names(a_l, rank, use_simple_n=use_simple_n)
+                    args_decl.extend([f"const int {nm}" for nm in exts])
+                args_decl.append(_emit_decl(_arg_c_name(str(a), av), av, vmap, real_type, False, as_arg=True))
+            if current["kind"] == "function":
+                ret_name = str(current.get("result") or "").lower()
+                ret_lookup = ret_name if ret_name else str(current.get("name", "")).lower()
+                rv = _fallback_function_result_var(current, real_type, kind_ctype_map) or vmap.get(ret_lookup) or Var(real_type)
+                ret_ct = f"{rv.ctype} *" if rv.is_array else rv.ctype
+            else:
+                ret_ct = "void"
+            sigs[str(current.get("name", "")).lower()] = (ret_ct, ", ".join(args_decl))
+            current = None
+            continue
+        current["body_lines"].append(code)
+    return sigs
+
 def transpile_fortran_to_c(
     text: str,
     *,
@@ -13342,6 +14424,7 @@ def transpile_fortran_to_c(
     annotate: bool = False,
     max_errors: int = 20,
 ) -> str:
+    text = re.sub(r"(?i)intent\s*\(\s*in\s+out\s*\)", "intent(inout)", text)
     text, rewrite_line_map = _rewrite_simple_forall(text)
     text, rewrite_line_map_2 = _rewrite_inline_if_write(text)
     rewrite_line_map = _compose_line_maps(rewrite_line_map, rewrite_line_map_2)
@@ -13387,10 +14470,38 @@ def transpile_fortran_to_c(
     module_param_maps, proc_parent_module = _extract_module_parameter_maps(text, real_type, kind_ctype_map)
     decl_maps: List[Dict[str, Var]] = [_parse_decls(u, real_type, kind_ctype_map) for u in units]
     for u, vmap in zip(units, decl_maps):
-        imported_params = _imported_module_parameters_for_unit(u, module_param_maps, proc_parent_module)
+        imported_params = _imported_module_parameters_for_unit(
+            u,
+            units,
+            module_param_maps,
+            proc_parent_module,
+            real_type,
+            kind_ctype_map,
+        )
         for nm, vv in imported_params.items():
             if nm not in vmap:
                 vmap[nm] = vv
+        iface_proc_kinds = _local_interface_proc_kinds(u)
+        iface_proc_sigs = _local_interface_proc_signatures(u, real_type, kind_ctype_map)
+        for a in u.get("args", []):
+            a_l = str(a).lower()
+            proc_kind = iface_proc_kinds.get(a_l)
+            if not proc_kind:
+                continue
+            sig = iface_proc_sigs.get(a_l)
+            vv = vmap.get(a_l)
+            if vv is None:
+                ctype = "void" if proc_kind == "subroutine" else real_type
+                if sig:
+                    ctype = sig[0]
+                vmap[a_l] = Var(ctype, is_external=True, proc_sig=(sig[1] if sig else None))
+            else:
+                vv.is_external = True
+                if sig:
+                    vv.proc_sig = sig[1]
+                    vv.ctype = sig[0]
+                if proc_kind == "subroutine":
+                    vv.ctype = "void"
     # Infer simple dummy-argument traits from usage:
     # - mutated scalar dummy -> inout
     # - scalar dummy used as callee (f(...)) -> external procedure argument
@@ -13616,7 +14727,8 @@ def transpile_fortran_to_c(
             proc_name = str(u.get("name", "")).lower()
             extent_lists = proc_arg_extent_names.get(proc_name, [])
             flat_exts = [e for lst in extent_lists for e in lst]
-            proto_simple_n = (len(flat_exts) == 1 and flat_exts[0] != "n")
+            arg_names_lower = {str(a).lower() for a in u.get("args", [])}
+            proto_simple_n = (len(flat_exts) == 1 and flat_exts[0] != "n" and "n" not in arg_names_lower)
             for idx, a in enumerate(u.get("args", [])):
                 av = vmap.get(str(a).lower(), Var("int"))
                 exts = extent_lists[idx] if idx < len(extent_lists) else []
@@ -13632,7 +14744,8 @@ def transpile_fortran_to_c(
             proc_name = str(u.get("name", "")).lower()
             extent_lists = proc_arg_extent_names.get(proc_name, [])
             flat_exts = [e for lst in extent_lists for e in lst]
-            proto_simple_n = (len(flat_exts) == 1 and flat_exts[0] != "n")
+            arg_names_lower = {str(a).lower() for a in u.get("args", [])}
+            proto_simple_n = (len(flat_exts) == 1 and flat_exts[0] != "n" and "n" not in arg_names_lower)
             for idx, a in enumerate(u.get("args", [])):
                 av = vmap.get(str(a).lower(), Var("int"))
                 exts = extent_lists[idx] if idx < len(extent_lists) else []

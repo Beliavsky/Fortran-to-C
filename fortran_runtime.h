@@ -31,9 +31,15 @@ int read_bytes_unit(int unit, long pos1, void *buf, size_t elem_size, int count)
 void write_a(int unit, const char *s); /* Write one character record with a trailing newline. */
 void write_i0_then_words(int unit, int iv, int n, const char *const *words); /* Write i0 followed by n space-separated character items. */
 int write_int_float_record(int unit, int iw, int fw, int fd, int iv, double rv); /* Write one formatted INTEGER/REAL text record. */
+int write_first_int_unit(int unit, int v); /* Write one list-directed INTEGER item to an external unit. */
+int write_first_float_unit(int unit, float v); /* Write one list-directed REAL item to an external unit. */
+int write_first_double_unit(int unit, double v); /* Write one list-directed DOUBLE PRECISION item to an external unit. */
 int read_a(int unit, char *buf, int len); /* Read one character record and blank-pad the destination buffer. */
 int read_int_float_record(int unit, int *iv, float *rv); /* Read one whitespace-separated INTEGER/REAL text record. */
 int read_int_double_record(int unit, int *iv, double *rv); /* Read one whitespace-separated INTEGER/DOUBLE text record. */
+int read_first_int_unit(int unit, int *out); /* Read the leading INTEGER item from an external list-directed record. */
+int read_first_float_unit(int unit, float *out); /* Read the leading REAL item from an external list-directed record. */
+int read_first_double_unit(int unit, double *out); /* Read the leading DOUBLE PRECISION item from an external list-directed record. */
 int read_int_s(const char *s, int *out); /* Parse a scalar INTEGER from an internal character buffer. */
 int read_float_s(const char *s, float *out); /* Parse a scalar REAL from an internal character buffer. */
 int read_double_s(const char *s, double *out); /* Parse a scalar DOUBLE PRECISION value from an internal character buffer. */
