@@ -1412,6 +1412,8 @@ def _emit(expr: Expr, parent_prec: int = 0, side: str = "") -> str:
     if expr.kind == "unary":
         cur = _precedence(expr)
         body = _emit(expr.operand, cur, "right")
+        if expr.value == "-" and (expr.operand.kind == "const" or expr.operand.kind == "unary"):
+            body = f"({body})"
         text = f"{expr.value}{body}"
         if cur < parent_prec:
             return f"({text})"

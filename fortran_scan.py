@@ -389,7 +389,7 @@ def find_implicit_none_undeclared_identifiers(
         "iand", "ior", "ieor", "ishft",
         "selected_real_kind", "selected_int_kind", "digits", "tiny", "maxexponent", "minexponent", "precision", "radix", "range", "bit_size",
         "nearest", "spacing", "exponent", "fraction", "set_exponent", "scale", "storage_size",
-        "cosd", "sind", "tand", "acosd", "asind", "bessel_j0", "bessel_j1", "bessel_y0", "bessel_y1",
+        "cosd", "sind", "tand", "acosd", "asind", "bessel_j0", "bessel_j1", "bessel_y0", "bessel_y1", "isnan",
         "int8", "int16", "int32", "int64", "real32", "real64", "real128", "null",
     }
 
@@ -471,8 +471,9 @@ def find_implicit_none_undeclared_identifiers(
                 break
         if contains_i is None:
             return out_n
-        for i in range(mod_start + 1, contains_i):
-            c = strip_comment(src[i]).strip()
+        module_decl_lines = src[mod_start + 1:contains_i]
+        for _lineno, stmt in iter_fortran_statements(module_decl_lines):
+            c = strip_comment(stmt).strip()
             if not c:
                 continue
             if declish_re.match(c):
@@ -501,6 +502,15 @@ def find_implicit_none_undeclared_identifiers(
                 out.append(" " if (in_single or in_double) else ch)
             i += 1
         return "".join(out)
+
+    def _strip_numeric_kind_suffixes(s: str) -> str:
+        """Remove kind suffixes from numeric literals without touching identifiers."""
+        return re.sub(
+            r"\b((?:\d+(?:\.\d*)?|\.\d+)(?:[de][+-]?\d+)?)_[a-z_]\w*\b",
+            r"\1",
+            s,
+            flags=re.IGNORECASE,
+        )
 
     def _local_derived_info(body: List[str]) -> Tuple[Set[str], List[Tuple[int, int]]]:
         names: Set[str] = set()
@@ -619,7 +629,7 @@ def find_implicit_none_undeclared_identifiers(
             lhs, rhs = code.split("::", 1)
             scan_txt = _strip_string_literals(lhs + " " + rhs)
             scan_txt = re.sub(r"%\s*[a-z_]\w*", "", scan_txt, flags=re.IGNORECASE)
-            scan_txt = re.sub(r"(?<=[0-9.])_[a-z_]\w*\b", "", scan_txt, flags=re.IGNORECASE)
+            scan_txt = _strip_numeric_kind_suffixes(scan_txt)
             kw_arg_names = {m.group(1).lower() for m in re.finditer(r"\b([a-z_]\w*)\s*=", scan_txt, flags=re.IGNORECASE)}
             for tok in re.findall(r"\b[a-z_]\w*\b", scan_txt, flags=re.IGNORECASE):
                 t = tok.lower()
@@ -718,7 +728,7 @@ def find_implicit_none_undeclared_identifiers(
 
             scan_txt = _strip_string_literals(code)
             scan_txt = re.sub(r"%\s*[a-z_]\w*", "", scan_txt, flags=re.IGNORECASE)
-            scan_txt = re.sub(r"(?<=[0-9.])_[a-z_]\w*\b", "", scan_txt, flags=re.IGNORECASE)
+            scan_txt = _strip_numeric_kind_suffixes(scan_txt)
             kw_arg_names = {m.group(1).lower() for m in re.finditer(r"\b([a-z_]\w*)\s*=", scan_txt, flags=re.IGNORECASE)}
             for tok in re.findall(r"\b[a-z_]\w*\b", scan_txt, flags=re.IGNORECASE):
                 t = tok.lower()
@@ -883,7 +893,7 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
                 in_implicit_main = True
             continue
         if re.match(
-            r"^(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|type(?:\s*\([^)]*\))?|class(?:\s*\([^)]*\))?|double\s+precision)(?=\s|,|::|$)(?:(?:\s*,\s*[^:]*)?\s*::\s*.+|\s+.+)$",
+            r"^(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|type(?:\s*\([^)]*\))?|class(?:\s*\([^)]*\))?|double\s+precision)(?=\s|,|::|$)(?:(?:\s*,\s*.*?)?\s*::\s*.+|\s+.+)$",
             low,
         ):
             if not unit_stack:
@@ -1212,7 +1222,7 @@ def parse_declared_names_from_decl(line: str) -> Set[str]:
         #   double precision x
         #   real(kind=dp) a, b
         m = re.match(
-            r"^\s*(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|double\s+precision|type\s*\([^)]*\)|class\s*\([^)]*\))(?:\s*,\s*[^:]*)?\s+(.+)$",
+            r"^\s*(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|double\s+precision|type\s*\([^)]*\)|class\s*\([^)]*\))(?:\s*,\s*.*?)?\s+(.+)$",
             line,
             re.IGNORECASE,
         )

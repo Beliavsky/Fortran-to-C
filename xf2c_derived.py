@@ -102,7 +102,7 @@ def _parse_derived_field_decl(
     if base is None:
         m = re.match(r"^logical(?:\s*,\s*([^:]+))?\s*::\s*(.+)$", code, re.IGNORECASE)
         if m:
-            base, attrs, rhs = 'int', (m.group(1) or ''), m.group(2)
+            base, attrs, rhs = 'logical', (m.group(1) or ''), m.group(2)
     if base is None:
         m = re.match(r"^character(?:\s*\([^)]*\))?(?:\s*,\s*([^:]+))?\s*::\s*(.+)$", code, re.IGNORECASE)
         if m:
@@ -190,8 +190,11 @@ def emit_local_derived_type_typedefs(
                 m_arr = re.match(r"^(.+)\[([^\[\]]+)\]$", fld_ctype)
                 if m_arr:
                     base = m_arr.group(1).strip()
+                    if base == "logical":
+                        base = "int"
                     dim = m_arr.group(2).strip()
                     out.append(" " * (indent + 3) + f"{base} {fld_name}[{dim}];")
                 else:
-                    out.append(" " * (indent + 3) + f"{fld_ctype} {fld_name};")
+                    cty = "int" if fld_ctype == "logical" else fld_ctype
+                    out.append(" " * (indent + 3) + f"{cty} {fld_name};")
         out.append(" " * indent + f"}} {dt_name};")
