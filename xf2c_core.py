@@ -3616,7 +3616,7 @@ def _rewrite_inline_if_write(text: str) -> tuple[str, List[int]]:
                 cond = raw[open_idx + 1 : close_idx].strip()
                 tail = raw[close_idx + 1 :].strip()
                 low_tail = tail.lower()
-                if tail and low_tail != "then" and not low_tail.startswith("then ") and not low_tail.startswith("then!"):
+                if tail and (not tail.rstrip().endswith("&")) and low_tail != "then" and not low_tail.startswith("then ") and not low_tail.startswith("then!"):
                     out.append(f"{indent}if ({cond}) then")
                     line_map.append(i)
                     out.append(f"{indent}   {tail}")
@@ -5129,7 +5129,9 @@ def _rewrite_assumed_shape_calls(
                     tmp_p = f"__tmp_arg_{ai}"
                     idx_n = f"__i_arg_{ai}"
                     base_cty = (ctype_lists[ai] if ai < len(ctype_lists) and ctype_lists[ai] else view_ctype or real_type)
-                    if base_cty.lower() == "string":
+                    if base_cty.lower() == "logical":
+                        base_cty = "int"
+                    elif base_cty.lower() == "string":
                         base_cty = "char *"
                     temp_specs.append((tmp_n, tmp_p, idx_n, base_cty, extent_expr, elem_c))
                     new_args.append(tmp_n)
@@ -7440,6 +7442,8 @@ def _emit_decl(
             return f"{prefix}char {nm}[{dim}][({clen}) + 1];"
         if v.init is not None:
             cinit = _convert_array_initializer(v.init, vars_map, real_type)
+            if not str(cinit).lstrip().startswith("{"):
+                cinit = "{0}" if (_eval_int_expr(str(v.init).strip()) == 0) else cinit
             if (v.dim or "").strip() in {"", "*"}:
                 return f"{prefix}{const_prefix}{v.ctype} {nm}[] = {cinit};"
             dim = _dim_product_expr(v.dim or "1", vars_map, real_type, assumed_extents=assumed_extents)
@@ -8034,6 +8038,7 @@ def _inject_runtime_helpers(lines: List[str]) -> List[str]:
         or ("close_unit(" in text)
         or ("inquire_file_info(" in text)
         or ("inquire_unit_info(" in text)
+        or ("skip_record_unit(" in text)
         or ("write_a(" in text)
         or ("read_a(" in text)
         or ("fill_rand_1d_float(" in text)
@@ -9691,6 +9696,13 @@ def _transpile_unit(
             if tail.startswith(','):
                 tail = tail[1:].strip()
             items = [x.strip() for x in _split_args_top_level(tail) if x.strip()] if tail else []
+            if unit_txt is not None and fmt_txt is not None and fmt_txt.strip() == '*' and len(items) == 0:
+                unit_c = _convert_expr(unit_txt, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                if iostat_txt:
+                    out.append(" " * indent + f"{iostat_txt} = skip_record_unit({unit_c});")
+                else:
+                    out.append(" " * indent + f"if (skip_record_unit({unit_c}) != 0) {fail_stmt}")
+                continue
             if unit_txt is not None and fmt_txt is None and len(items) == 1:
                 tgt_raw = items[0].strip()
                 tgt_nm_m = re.match(r"^\s*([a-z_]\w*)\s*$", tgt_raw, re.IGNORECASE)
@@ -10586,10 +10598,26 @@ def _transpile_unit(
             array_byref = proc_arg_array_byref.get(callee.lower(), [])
             extent_lists = proc_arg_extent_names.get(callee.lower(), [])
             formal_names = proc_arg_names.get(callee.lower(), [])
+            if (not any(extent_lists)) and len(fargs) >= 1:
+                vv_callee = vars_map.get(callee.lower())
+                if vv_callee is not None and vv_callee.is_external and vv_callee.proc_sig:
+                    sig_parts = [p.strip() for p in _split_args_top_level(vv_callee.proc_sig) if p.strip()]
+                    array_arg_idxs = []
+                    for idx_f, a_f in enumerate(fargs):
+                        m_id_f = re.match(r"^\s*([a-z_]\w*)\s*$", a_f, re.IGNORECASE)
+                        if not m_id_f:
+                            continue
+                        av_f = vars_map.get(m_id_f.group(1).lower())
+                        if av_f is not None and av_f.is_array and len(_resolved_dim_parts(av_f, m_id_f.group(1).lower(), assumed_extents)) == 1:
+                            array_arg_idxs.append(idx_f)
+                    if len(sig_parts) == len(fargs) + 1 and len(array_arg_idxs) == 1:
+                        synth_exts: List[List[str]] = [[] for _ in fargs]
+                        synth_exts[array_arg_idxs[0]] = ["__ext"]
+                        extent_lists = synth_exts
             cargs: List[str] = []
             pre_call: List[str] = []
             post_call: List[str] = []
-            n_expected = max(len(modes), len(opts))
+            n_expected = max(len(modes), len(opts), len(fargs))
             for k in range(n_expected):
                 if k >= len(fargs):
                     exts = extent_lists[k] if k < len(extent_lists) else []
@@ -10731,8 +10759,27 @@ def _transpile_unit(
             ):
                 continue
             scalar_only = True
-            scalar_parts: List[tuple[str, str]] = []
+            scalar_parts: List[tuple[str, str, str]] = []
+            scalar_array_intrinsics = {
+                "abs", "sqrt", "sin", "cos", "tan", "asin", "acos", "atan",
+                "exp", "log", "log10", "real", "dble", "int", "nint",
+                "anint", "aint", "floor", "ceiling", "mod", "modulo",
+                "merge",
+            }
             for pit in items:
+                if "[" in pit and "]" in pit:
+                    scalar_only = False
+                    break
+                if _resolve_type_bound_write_proc_name(pit, vars_map):
+                    scalar_only = False
+                    break
+                if "%" in pit:
+                    parts_dt = [p.strip().lower() for p in pit.split("%") if p.strip()]
+                    if len(parts_dt) >= 2:
+                        fld_spec_dt = _derived_field_spec(parts_dt[0], parts_dt[1:], vars_map)
+                        if fld_spec_dt is not None and _derived_field_rank(fld_spec_dt) != 0:
+                            scalar_only = False
+                            break
                 m_exact_sec_scalar = re.match(r"^\s*([a-z_]\w*)\s*\(\s*([^()]*)\s*\)\s*$", pit, re.IGNORECASE)
                 if m_exact_sec_scalar:
                     an_scalar = m_exact_sec_scalar.group(1).lower()
@@ -10746,14 +10793,80 @@ def _transpile_unit(
                     if vv is not None and vv.is_array:
                         scalar_only = False
                         break
+                for arr_name in vars_map:
+                    vv_arr = vars_map.get(arr_name)
+                    if vv_arr is None or not vv_arr.is_array:
+                        continue
+                    if re.search(rf"\b{re.escape(arr_name)}\s*\(\s*[^()]*:[^()]*\)", pit, re.IGNORECASE):
+                        scalar_only = False
+                        break
+                if not scalar_only:
+                    break
+                toks_p = {t.lower() for t in re.findall(r"\b[a-z_]\w*\b", _strip_comment(pit), flags=re.IGNORECASE)}
+                arrs_p = [t for t in sorted(toks_p) if t in vars_map and vars_map[t].is_array]
+                if arrs_p and not any(re.search(rf"\b{re.escape(a)}\s*\(", pit, flags=re.IGNORECASE) for a in arrs_p):
+                    if "(" not in pit:
+                        scalar_only = False
+                        break
+                    m_known_elem = re.match(r"^\s*([a-z_]\w*)\s*\((.*)\)\s*$", pit, re.IGNORECASE)
+                    if m_known_elem and m_known_elem.group(1).lower() in scalar_array_intrinsics:
+                        scalar_only = False
+                        break
+                m_arr_intr = re.match(r"^\s*(sum|product|shape|lbound|ubound|minloc|maxloc|findloc|spread|pack|reshape)\s*\((.*)\)\s*$", pit, re.IGNORECASE)
+                if m_arr_intr:
+                    nm_intr = m_arr_intr.group(1).lower()
+                    iargs_intr = [x.strip() for x in _split_args_top_level(m_arr_intr.group(2)) if x.strip()]
+                    if nm_intr in {"shape", "minloc", "maxloc", "findloc", "spread", "pack", "reshape"}:
+                        scalar_only = False
+                        break
+                    if nm_intr in {"sum", "product"} and len(iargs_intr) >= 2:
+                        scalar_only = False
+                        break
+                    if nm_intr in {"lbound", "ubound"} and len(iargs_intr) == 1:
+                        scalar_only = False
+                        break
                 cty_p = _format_item_ctype(pit, vars_map, real_type)
                 cexpr_p = _convert_expr(pit, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
-                scalar_parts.append((cty_p, cexpr_p))
+                scalar_parts.append((pit, cty_p, cexpr_p))
             if scalar_only and scalar_parts:
                 out.append(" " * indent + "{")
                 out.append(" " * (indent + 3) + "int __first = 1;")
                 prev_string_like = False
-                for cty_p, cexpr_p in scalar_parts:
+                for pit, cty_p, cexpr_p in scalar_parts:
+                    m_int_vec = re.match(r"^\s*\(\(int\[\]\)\{(.*)\}\)\s*$", cexpr_p)
+                    if cty_p == "int" and m_int_vec:
+                        for vv in [x.strip() for x in _split_args_top_level(m_int_vec.group(1)) if x.strip()]:
+                            _emit_list_directed_scalar_printf(
+                                out,
+                                indent + 3,
+                                vv,
+                                "int",
+                                vars_map,
+                                real_type,
+                                prefix_expr='__first ? "" : " "',
+                            )
+                            out.append(" " * (indent + 3) + "__first = 0;")
+                        prev_string_like = False
+                        continue
+                    m_simple_dt = re.fullmatch(r"([a-z_]\w*)", pit, re.IGNORECASE)
+                    if m_simple_dt:
+                        vv_dt = vars_map.get(m_simple_dt.group(1).lower())
+                        dt_name = (vv_dt.ctype or "").lower() if vv_dt is not None else ""
+                        if vv_dt is not None and dt_name in _ACTIVE_DERIVED_TYPES and dt_name not in _ACTIVE_TYPE_BOUND_WRITE_BINDINGS:
+                            for fld_name, fld_cty in _ACTIVE_DERIVED_TYPES.get(dt_name, []):
+                                sep_expr = '""' if prev_string_like and fld_cty.lower() in {"string", "trim_string"} else '" "'
+                                _emit_list_directed_scalar_printf(
+                                    out,
+                                    indent + 3,
+                                    f"{cexpr_p}.{fld_name}",
+                                    fld_cty,
+                                    vars_map,
+                                    real_type,
+                                    prefix_expr=f'__first ? "" : {sep_expr}',
+                                )
+                                out.append(" " * (indent + 3) + "__first = 0;")
+                                prev_string_like = fld_cty.lower() in {"string", "trim_string"}
+                            continue
                     sep_expr = '""' if prev_string_like and cty_p in {"string", "trim_string"} else '" "'
                     _emit_list_directed_scalar_printf(
                         out,
@@ -14434,6 +14547,125 @@ def _transpile_unit(
                                         out.append(" " * (indent + 3) + f"{lhs_nm_arr}[i_fill] = __red;")
                                         out.append(" " * indent + "}")
                                         continue
+                    lhs_rank = len(lhs_parts_resolved)
+                    m_rhs_call_whole = re.match(r"^([a-z_]\w*)\s*\((.*)\)\s*$", rhs_raw, re.IGNORECASE)
+                    rhs_scan = _strip_comment(rhs_raw)
+                    rhs_tokens = {t.lower() for t in re.findall(r"\b[a-z_]\w*\b", rhs_scan, flags=re.IGNORECASE)}
+                    rhs_array_names = [tok for tok in sorted(rhs_tokens) if tok in vars_map and vars_map[tok].is_array]
+                    lhs_parts_resolved = _resolved_dim_parts(lv_arr, lhs_nm_arr, assumed_extents) if (lv_arr.is_allocatable or lv_arr.is_pointer or _is_assumed_shape(lv_arr.dim)) else _dim_parts(lv_arr.dim)
+                    sum_red = _extract_rank_reducing_sum(rhs_raw) if len(lhs_parts_resolved) == 1 else None
+                    if sum_red is not None:
+                        pre, arg_expr, red_dim, post = sum_red
+                        if red_dim in {1, 2}:
+                            elem_expr = _rewrite_rank2_reduction_term(
+                                arg_expr,
+                                red_dim,
+                                "j_fill",
+                                "i_fill",
+                                vars_map,
+                                real_type,
+                                byref_scalars,
+                                assumed_extents,
+                                proc_arg_extent_names,
+                            )
+                            if elem_expr is not None:
+                                rank2_names = [
+                                    name for name, vv in vars_map.items()
+                                    if vv.is_array and len(_resolved_dim_parts(vv, name, assumed_extents)) == 2
+                                    and re.search(rf"\b{re.escape(name)}\b", arg_expr, re.IGNORECASE)
+                                ]
+                                if rank2_names:
+                                    red_arr = rank2_names[0]
+                                    rv_red = vars_map[red_arr]
+                                    red_parts = _resolved_dim_parts(rv_red, red_arr, assumed_extents)
+                                    out_len = red_parts[1] if red_dim == 1 else red_parts[0]
+                                    tmp_var = "__red"
+                                    vars_map_red = dict(vars_map)
+                                    vars_map_red[tmp_var] = Var(rv_red.ctype or real_type)
+                                    expr_red = f"{pre}{tmp_var}{post}"
+                                    rhs_red = _convert_expr(
+                                        expr_red,
+                                        vars_map_red,
+                                        real_type,
+                                        byref_scalars,
+                                        assumed_extents,
+                                        proc_arg_extent_names,
+                                    )
+                                    elem_c = _convert_expr(
+                                        elem_expr,
+                                        vars_map,
+                                        real_type,
+                                        byref_scalars,
+                                        assumed_extents,
+                                        proc_arg_extent_names,
+                                    )
+                                    elem_c = _replace_pow(elem_c)
+                                    if lv_arr.is_allocatable:
+                                        out.append(" " * indent + f"if ({lhs_nm_arr}) free({lhs_nm_arr});")
+                                        out.append(" " * indent + f"{lhs_nm_arr} = ({lv_arr.ctype}*) malloc(sizeof({lv_arr.ctype}) * ({out_len}));")
+                                        out.append(" " * indent + f"if (!{lhs_nm_arr} && ({out_len}) > 0) {fail_stmt}")
+                                        out.append(" " * indent + f"{_alloc_len_name(lhs_nm_arr)} = {out_len};")
+                                    inner_extent = _convert_expr(red_parts[0 if red_dim == 1 else 1], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                                    out.append(" " * indent + "{")
+                                    out.append(" " * (indent + 3) + f"{rv_red.ctype} {tmp_var};")
+                                    out.append(" " * (indent + 3) + f"for (int j_fill = 0; j_fill < ({out_len}); ++j_fill) {{")
+                                    out.append(" " * (indent + 6) + f"{tmp_var} = 0;")
+                                    out.append(" " * (indent + 6) + f"for (int i_fill = 0; i_fill < ({inner_extent}); ++i_fill) {tmp_var} += {elem_c};")
+                                    out.append(" " * (indent + 6) + f"{lhs_nm_arr}[j_fill] = {rhs_red};")
+                                    out.append(" " * (indent + 3) + "}")
+                                    out.append(" " * indent + "}")
+                                    continue
+                    m_pack = re.match(r"^pack\s*\(\s*(.*)\s*\)\s*$", rhs_raw, re.IGNORECASE)
+                    if m_pack and len(lhs_parts_resolved) == 1:
+                        pargs = [x.strip() for x in _split_args_top_level(m_pack.group(1)) if x.strip()]
+                        if len(pargs) >= 2:
+                            src_raw = pargs[0]
+                            mask_raw = pargs[1]
+                            if not any(re.search(rf"\b{re.escape(tok)}\s*\(", src_raw, flags=re.IGNORECASE) for tok in rhs_array_names) and not any(re.search(rf"\b{re.escape(tok)}\s*\(", mask_raw, flags=re.IGNORECASE) for tok in rhs_array_names):
+                                rank1_arrays = []
+                                base_extent = None
+                                shape_ok = True
+                                for an in rhs_array_names:
+                                    vv = vars_map.get(an)
+                                    if vv is None or (not vv.is_array):
+                                        continue
+                                    dps = _resolved_dim_parts(vv, an, assumed_extents)
+                                    if len(dps) != 1:
+                                        shape_ok = False
+                                        break
+                                    rank1_arrays.append(an)
+                                    cur_extent = _convert_expr(dps[0], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                                    cur_key = cur_extent.replace(" ", "").lower()
+                                    if base_extent is None:
+                                        base_extent = cur_extent
+                                    elif base_extent.replace(" ", "").lower() != cur_key:
+                                        shape_ok = False
+                                        break
+                                if shape_ok and base_extent is not None and rank1_arrays:
+                                    src_elem = src_raw
+                                    mask_elem = mask_raw
+                                    for an in sorted(rank1_arrays, key=len, reverse=True):
+                                        src_elem = re.sub(rf"\b{re.escape(an)}\b", f"{an}[i_fill]", src_elem, flags=re.IGNORECASE)
+                                        mask_elem = re.sub(rf"\b{re.escape(an)}\b", f"{an}[i_fill]", mask_elem, flags=re.IGNORECASE)
+                                    src_c = _convert_expr(src_elem, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                                    mask_c = _convert_expr(mask_elem, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                                    out.append(" " * indent + "{")
+                                    out.append(" " * (indent + 3) + "int pack_n = 0;")
+                                    out.append(" " * (indent + 3) + f"for (int i_fill = 0; i_fill < ({base_extent}); ++i_fill) if ({mask_c}) ++pack_n;")
+                                    if lv_arr.is_allocatable:
+                                        out.append(" " * (indent + 3) + f"if ({lhs_nm_arr}) free({lhs_nm_arr});")
+                                        out.append(" " * (indent + 3) + f"{lhs_nm_arr} = ({lv_arr.ctype}*) malloc(sizeof({lv_arr.ctype}) * pack_n);")
+                                        out.append(" " * (indent + 3) + f"if (!{lhs_nm_arr} && pack_n > 0) {fail_stmt}")
+                                        for en in _alloc_extent_names(lhs_nm_arr, 1):
+                                            out.append(" " * (indent + 3) + f"{en} = pack_n;")
+                                    out.append(" " * (indent + 3) + "for (int i_fill = 0, j_fill = 0; i_fill < (" + base_extent + "); ++i_fill) {")
+                                    out.append(" " * (indent + 6) + f"if ({mask_c}) {{")
+                                    out.append(" " * (indent + 9) + f"{lhs_nm_arr}[j_fill] = {src_c};")
+                                    out.append(" " * (indent + 9) + "++j_fill;")
+                                    out.append(" " * (indent + 6) + "}")
+                                    out.append(" " * (indent + 3) + "}")
+                                    out.append(" " * indent + "}")
+                                    continue
                     rhs_view = _rewrite_rank1_view_expr(
                         rhs_raw,
                         "p_fill",
@@ -14443,10 +14675,9 @@ def _transpile_unit(
                         assumed_extents,
                         proc_arg_extent_names,
                     )
-                    lhs_rank = len(lhs_parts_resolved)
                     if rhs_view is not None and lhs_rank == 1:
                         rhs, rhs_extent, _ = rhs_view
-                        if lv_arr.is_allocatable or lv_arr.is_pointer:
+                        if lv_arr.is_allocatable:
                             out.append(" " * indent + f"if ({lhs_nm_arr}) free({lhs_nm_arr});")
                             out.append(" " * indent + f"{lhs_nm_arr} = ({lv_arr.ctype}*) malloc(sizeof({lv_arr.ctype}) * ({rhs_extent}));")
                             out.append(" " * indent + f"if (!{lhs_nm_arr} && ({rhs_extent}) > 0) {fail_stmt}")
@@ -14456,11 +14687,6 @@ def _transpile_unit(
                         out.append(" " * (indent + 3) + f"{lhs_nm_arr}[p_fill] = {rhs};")
                         out.append(" " * indent + "}")
                         continue
-                    m_rhs_call_whole = re.match(r"^([a-z_]\w*)\s*\((.*)\)\s*$", rhs_raw, re.IGNORECASE)
-                    rhs_scan = _strip_comment(rhs_raw)
-                    rhs_tokens = {t.lower() for t in re.findall(r"\b[a-z_]\w*\b", rhs_scan, flags=re.IGNORECASE)}
-                    rhs_array_names = [tok for tok in sorted(rhs_tokens) if tok in vars_map and vars_map[tok].is_array]
-                    lhs_parts_resolved = _resolved_dim_parts(lv_arr, lhs_nm_arr, assumed_extents) if (lv_arr.is_allocatable or lv_arr.is_pointer or _is_assumed_shape(lv_arr.dim)) else _dim_parts(lv_arr.dim)
                     if m_rhs_call_whole:
                         raw_args = _split_args_top_level(m_rhs_call_whole.group(2).strip()) if m_rhs_call_whole.group(2).strip() else []
                         callee = _resolve_generic_proc_name(m_rhs_call_whole.group(1), raw_args, vars_map, real_type)
@@ -14551,57 +14777,6 @@ def _transpile_unit(
                                 out.append(" " * (indent + 3) + "}")
                                 out.append(" " * indent + "}")
                                 continue
-                    m_pack = re.match(r"^pack\s*\(\s*(.*)\s*\)\s*$", rhs_raw, re.IGNORECASE)
-                    if m_pack and len(lhs_parts_resolved) == 1:
-                        pargs = [x.strip() for x in _split_args_top_level(m_pack.group(1)) if x.strip()]
-                        if len(pargs) >= 2:
-                            src_raw = pargs[0]
-                            mask_raw = pargs[1]
-                            if not any(re.search(rf"\b{re.escape(tok)}\s*\(", src_raw, flags=re.IGNORECASE) for tok in rhs_array_names) and not any(re.search(rf"\b{re.escape(tok)}\s*\(", mask_raw, flags=re.IGNORECASE) for tok in rhs_array_names):
-                                rank1_arrays = []
-                                base_extent = None
-                                shape_ok = True
-                                for an in rhs_array_names:
-                                    vv = vars_map.get(an)
-                                    if vv is None or (not vv.is_array):
-                                        continue
-                                    dps = _resolved_dim_parts(vv, an, assumed_extents)
-                                    if len(dps) != 1:
-                                        shape_ok = False
-                                        break
-                                    rank1_arrays.append(an)
-                                    cur_extent = _convert_expr(dps[0], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
-                                    cur_key = cur_extent.replace(" ", "").lower()
-                                    if base_extent is None:
-                                        base_extent = cur_extent
-                                    elif base_extent.replace(" ", "").lower() != cur_key:
-                                        shape_ok = False
-                                        break
-                                if shape_ok and base_extent is not None and rank1_arrays:
-                                    src_elem = src_raw
-                                    mask_elem = mask_raw
-                                    for an in sorted(rank1_arrays, key=len, reverse=True):
-                                        src_elem = re.sub(rf"\b{re.escape(an)}\b", f"{an}[i_fill]", src_elem, flags=re.IGNORECASE)
-                                        mask_elem = re.sub(rf"\b{re.escape(an)}\b", f"{an}[i_fill]", mask_elem, flags=re.IGNORECASE)
-                                    src_c = _convert_expr(src_elem, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
-                                    mask_c = _convert_expr(mask_elem, vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
-                                    out.append(" " * indent + "{")
-                                    out.append(" " * (indent + 3) + "int pack_n = 0;")
-                                    out.append(" " * (indent + 3) + f"for (int i_fill = 0; i_fill < ({base_extent}); ++i_fill) if ({mask_c}) ++pack_n;")
-                                    if lv_arr.is_allocatable:
-                                        out.append(" " * (indent + 3) + f"if ({lhs_nm_arr}) free({lhs_nm_arr});")
-                                        out.append(" " * (indent + 3) + f"{lhs_nm_arr} = ({lv_arr.ctype}*) malloc(sizeof({lv_arr.ctype}) * pack_n);")
-                                        out.append(" " * (indent + 3) + f"if (!{lhs_nm_arr} && pack_n > 0) {fail_stmt}")
-                                        for en in _alloc_extent_names(lhs_nm_arr, 1):
-                                            out.append(" " * (indent + 3) + f"{en} = pack_n;")
-                                    out.append(" " * (indent + 3) + "for (int i_fill = 0, j_fill = 0; i_fill < (" + base_extent + "); ++i_fill) {")
-                                    out.append(" " * (indent + 6) + f"if ({mask_c}) {{")
-                                    out.append(" " * (indent + 9) + f"{lhs_nm_arr}[j_fill] = {src_c};")
-                                    out.append(" " * (indent + 9) + "++j_fill;")
-                                    out.append(" " * (indent + 6) + "}")
-                                    out.append(" " * (indent + 3) + "}")
-                                    out.append(" " * indent + "}")
-                                    continue
                     rhs_uses_array = len(rhs_array_names) > 0
                     if not rhs_uses_array:
                         # Scalar-to-whole-array assignment.
@@ -14749,68 +14924,6 @@ def _transpile_unit(
                                 )
                                 for an in rhs_array_names
                             )
-                    sum_red = _extract_rank_reducing_sum(rhs_raw) if len(lhs_parts_resolved) == 1 else None
-                    if sum_red is not None:
-                        pre, arg_expr, red_dim, post = sum_red
-                        if red_dim in {1, 2}:
-                            elem_expr = _rewrite_rank2_reduction_term(
-                                arg_expr,
-                                red_dim,
-                                "j_fill",
-                                "i_fill",
-                                vars_map,
-                                real_type,
-                                byref_scalars,
-                                assumed_extents,
-                                proc_arg_extent_names,
-                            )
-                            if elem_expr is not None:
-                                rank2_names = [
-                                    name for name, vv in vars_map.items()
-                                    if vv.is_array and len(_resolved_dim_parts(vv, name, assumed_extents)) == 2
-                                    and re.search(rf"\b{re.escape(name)}\b", arg_expr, re.IGNORECASE)
-                                ]
-                                if rank2_names:
-                                    red_arr = rank2_names[0]
-                                    rv_red = vars_map[red_arr]
-                                    red_parts = _resolved_dim_parts(rv_red, red_arr, assumed_extents)
-                                    out_len = red_parts[1] if red_dim == 1 else red_parts[0]
-                                    tmp_var = "__red"
-                                    vars_map_red = dict(vars_map)
-                                    vars_map_red[tmp_var] = Var(rv_red.ctype or real_type)
-                                    expr_red = f"{pre}{tmp_var}{post}"
-                                    rhs_red = _convert_expr(
-                                        expr_red,
-                                        vars_map_red,
-                                        real_type,
-                                        byref_scalars,
-                                        assumed_extents,
-                                        proc_arg_extent_names,
-                                    )
-                                    elem_c = _convert_expr(
-                                        elem_expr,
-                                        vars_map,
-                                        real_type,
-                                        byref_scalars,
-                                        assumed_extents,
-                                        proc_arg_extent_names,
-                                    )
-                                    elem_c = _replace_pow(elem_c)
-                                    if lv_arr.is_allocatable:
-                                        out.append(" " * indent + f"if ({lhs_nm_arr}) free({lhs_nm_arr});")
-                                        out.append(" " * indent + f"{lhs_nm_arr} = ({lv_arr.ctype}*) malloc(sizeof({lv_arr.ctype}) * ({out_len}));")
-                                        out.append(" " * indent + f"if (!{lhs_nm_arr} && ({out_len}) > 0) {fail_stmt}")
-                                        out.append(" " * indent + f"{_alloc_len_name(lhs_nm_arr)} = {out_len};")
-                                    inner_extent = _convert_expr(red_parts[0 if red_dim == 1 else 1], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
-                                    out.append(" " * indent + "{")
-                                    out.append(" " * (indent + 3) + f"{rv_red.ctype} {tmp_var};")
-                                    out.append(" " * (indent + 3) + f"for (int j_fill = 0; j_fill < ({out_len}); ++j_fill) {{")
-                                    out.append(" " * (indent + 6) + f"{tmp_var} = 0;")
-                                    out.append(" " * (indent + 6) + f"for (int i_fill = 0; i_fill < ({inner_extent}); ++i_fill) {tmp_var} += {elem_c};")
-                                    out.append(" " * (indent + 6) + f"{lhs_nm_arr}[j_fill] = {rhs_red};")
-                                    out.append(" " * (indent + 3) + "}")
-                                    out.append(" " * indent + "}")
-                                    continue
                     if (not explicit_subscript) and same_shape:
                         rhs_elem = rhs_raw
                         # Replace array variables with element access, longest first.
@@ -15155,6 +15268,7 @@ def _extract_module_decl_maps(
     proc_parent_module: Dict[str, str] = {}
     current_module: Optional[str] = None
     before_contains = False
+    type_depth = 0
     for raw in lines:
         code = _strip_comment(raw).strip()
         if not code:
@@ -15175,6 +15289,13 @@ def _extract_module_decl_maps(
             before_contains = False
             continue
         if before_contains:
+            if re.match(r"^type(?:\s*,\s*[^:]*)?\s*(?:::)?\s*[a-z_]\w*\s*$", code, re.IGNORECASE) and not re.match(r"^type\s*\(", code, re.IGNORECASE):
+                type_depth += 1
+                continue
+            if type_depth > 0:
+                if re.match(r"^end\s+type\b", code, re.IGNORECASE):
+                    type_depth -= 1
+                continue
             module_decl_lines[current_module].append(code)
             continue
         m_proc = re.match(
@@ -15633,9 +15754,19 @@ def transpile_fortran_to_c(
         "",
     ]
     module_decl_maps, proc_parent_module = _extract_module_decl_maps(text, real_type, kind_ctype_map)
+    module_proc_names: Dict[str, set[str]] = {}
+    for proc_name, mod_name in proc_parent_module.items():
+        module_proc_names.setdefault(str(mod_name).lower(), set()).add(str(proc_name).lower())
+    shared_runtime_modules = {
+        mod_name
+        for mod_name, proc_names in module_proc_names.items()
+        if proc_names and proc_names.issubset(_SHARED_RUNTIME_PROCS)
+    }
     decl_maps: List[Dict[str, Var]] = [_parse_decls(u, real_type, kind_ctype_map) for u in units]
     emitted_module_globals: set[str] = set()
-    for decls in module_decl_maps.values():
+    for mod_name, decls in module_decl_maps.items():
+        if str(mod_name).lower() in shared_runtime_modules:
+            continue
         for nm, vv in decls.items():
             if vv.is_param or vv.is_external:
                 continue

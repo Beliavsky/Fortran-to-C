@@ -6,6 +6,10 @@
 #include <string.h>
 #include <ctype.h>
 
+int read_first_int_s(const char *s, int *out);
+int read_first_float_s(const char *s, float *out);
+int read_first_double_s(const char *s, double *out);
+
 static char *tmp_str_buf(size_t need) {
    /* Reuse a small ring of heap buffers for transient string results. */
    static char *buf[8] = {0};
@@ -479,6 +483,18 @@ int read_a(int unit, char *buf, int len) {
    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = '\0';
    for (int i = n; i < len; ++i) buf[i] = ' ';
    buf[len] = '\0';
+   return 0;
+}
+
+
+int skip_record_unit(int unit) {
+   /* Read and discard one text record from an external unit. */
+   FILE *fp = unit_get(unit);
+   int ch;
+   if (!fp) return 1;
+   ch = fgetc(fp);
+   if (ch == EOF) return 1;
+   while (ch != EOF && ch != '\n') ch = fgetc(fp);
    return 0;
 }
 

@@ -977,7 +977,7 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
             if not unit_stack:
                 in_implicit_main = True
             continue
-        if re.match(r"^read\s*\(.*\)\s+.+$", low):
+        if re.match(r"^read\s*\(.*\)(?:\s+.+)?$", low):
             if not unit_stack:
                 in_implicit_main = True
             continue

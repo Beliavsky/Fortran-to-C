@@ -38,6 +38,7 @@ int write_first_int_unit(int unit, int v); /* Write one list-directed INTEGER it
 int write_first_float_unit(int unit, float v); /* Write one list-directed REAL item to an external unit. */
 int write_first_double_unit(int unit, double v); /* Write one list-directed DOUBLE PRECISION item to an external unit. */
 int read_a(int unit, char *buf, int len); /* Read one character record and blank-pad the destination buffer. */
+int skip_record_unit(int unit); /* Read and discard one text record from an external unit. */
 int read_int_float_record(int unit, int *iv, float *rv); /* Read one whitespace-separated INTEGER/REAL text record. */
 int read_int_double_record(int unit, int *iv, double *rv); /* Read one whitespace-separated INTEGER/DOUBLE text record. */
 int read_first_int_unit(int unit, int *out); /* Read the leading INTEGER item from an external list-directed record. */

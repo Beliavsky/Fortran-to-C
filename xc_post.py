@@ -1665,6 +1665,10 @@ def _rewrite_assignment_rhs(code: str) -> str:
     return f"{lhs.rstrip()} {rhs_new}{code[semi:]}"
 
 
+def _fix_stringified_nul_char_literal(code: str) -> str:
+    return re.sub(r'=\s*"\\\\0"\s*;', "= '\\0';", code)
+
+
 def postprocess_c_line(line: str, rename_map: Optional[dict[str, str]] = None) -> str:
     eol = "\n" if line.endswith("\n") else ""
     body = line[:-1] if eol else line
@@ -1675,6 +1679,7 @@ def postprocess_c_line(line: str, rename_map: Optional[dict[str, str]] = None) -
     code = _rewrite_bracket_exprs(code)
     code = _rewrite_paren_exprs(code)
     code = _rewrite_assignment_rhs(code)
+    code = _fix_stringified_nul_char_literal(code)
     return f"{code}{comment}{eol}"
 
 
