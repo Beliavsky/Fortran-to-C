@@ -1,6 +1,6 @@
 # Fortran-to-C
 
-`xf2c.py` is a Python source-to-source transpiler, developed with Codex, that converts a substantial subset of free-form Fortran into readable C.
+`xf2c.py` is a Python source-to-source transpiler, developed with Codex, that converts a substantial subset of Fortran into readable C.
 
 It is intended for:
 
@@ -209,7 +209,7 @@ python xf2c_batch.py xhello.f90 --opts "--compile"
 
 ## Example
 
-- [xreturns_stats.md](xreturns_stats.md): example page showing the Fortran source, generated C, and both outputs for a program that reads stock prices and computes returns statistics and correlations
+- [xreturns_stats.md](xreturns_stats.md): example page showing the Fortran source, generated C, and both outputs for a program that reads stock prices and computes returns statistics and correlations. Many other examples are [here](https://github.com/Beliavsky/Fortran-to-C-Examples).
 
 ## What Works Well Today
 
