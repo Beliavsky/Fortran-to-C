@@ -9,9 +9,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
+_CHAR_DECL_RE = r"character(?:\s*\((?:[^()]|\([^()]*\))*\))?"
+_ASSIGN_LHS_RE = r"[a-z_]\w*(?:\s*\((?:[^()]|\([^()]*\))*\))?(?:\s*%\s*[a-z_]\w*(?:\s*\((?:[^()]|\([^()]*\))*\))?)*"
+
 PROC_START_RE = re.compile(
     r"^\s*(?P<prefix>(?:(?:pure|elemental|impure|recursive|module)\s+)*)"
-    r"(?:(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|double\s+precision)\s+)?"
+    rf"(?:(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|{_CHAR_DECL_RE}|complex(?:\s*\([^)]*\))?|double\s+precision)\s+)?"
     r"(?P<kind>function|subroutine)\s+"
     r"(?P<name>[a-z][a-z0-9_]*)\s*(?P<arglist>\([^)]*\))?",
     re.IGNORECASE,
@@ -205,7 +208,7 @@ def split_fortran_units_simple(text: str) -> List[Dict[str, object]]:
     stmts = iter_fortran_statements(lines)
 
     proc_hdr_re = re.compile(
-        r"^(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|double\s+precision)\s+)?(function|subroutine)\s+([a-z_]\w*)\s*(\([^)]*\))?(?:\s*result\s*\(\s*([a-z_]\w*)\s*\))?\s*$",
+        rf"^(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|{_CHAR_DECL_RE}|complex(?:\s*\([^)]*\))?|double\s+precision)\s+)?(function|subroutine)\s+([a-z_]\w*)\s*(\([^)]*\))?(?:\s*result\s*\(\s*([a-z_]\w*)\s*\))?\s*$",
         re.IGNORECASE,
     )
     prog_hdr_re = re.compile(r"^program\s+([a-z_]\w*)\s*$", re.IGNORECASE)
@@ -354,6 +357,7 @@ def find_implicit_none_undeclared_identifiers(
     text: str,
     *,
     known_procedure_names: Optional[Set[str]] = None,
+    std: str = "",
 ) -> List[str]:
     """Find likely undeclared identifiers in units under `implicit none`.
 
@@ -361,6 +365,10 @@ def find_implicit_none_undeclared_identifiers(
     """
     units = split_fortran_units_simple(text)
     known = {n.lower() for n in (known_procedure_names or set())}
+    defined_operator_names = {
+        m.group(1).lower()
+        for m in re.finditer(r"interface\s+operator\s*\(\s*\.([a-z_]\w*)\.\s*\)", text, re.IGNORECASE)
+    }
     has_any_implicit_none = re.search(
         r"^\s*implicit\s+none\b", text, re.IGNORECASE | re.MULTILINE
     ) is not None
@@ -374,7 +382,7 @@ def find_implicit_none_undeclared_identifiers(
         "kind", "len", "parameter", "optional", "double", "precision", "select", "case", "default", "procedure",
         "save", "external", "dimension", "allocatable", "pointer", "target", "exit", "cycle", "stop", "error", "and", "or", "not", "eqv", "neqv",
         "intrinsic", "public", "private", "generic",
-        "true", "false", "while",
+        "true", "false", "while", "block", "where", "elsewhere",
     }
     intrinsics = {
         "sqrt", "real", "int", "dble", "nint", "anint", "aint", "floor", "ceiling", "log10", "sign", "mod", "modulo",
@@ -392,6 +400,8 @@ def find_implicit_none_undeclared_identifiers(
         "cosd", "sind", "tand", "acosd", "asind", "bessel_j0", "bessel_j1", "bessel_y0", "bessel_y1", "isnan",
         "int8", "int16", "int32", "int64", "real32", "real64", "real128", "null",
     }
+    if std.lower() != "f2023":
+        intrinsics.add("getcwd")
 
     declish_re = re.compile(
         r"^\s*(?:integer|real|logical|character|complex|type\b|class\b|double\s+precision)\b",
@@ -562,7 +572,7 @@ def find_implicit_none_undeclared_identifiers(
                     names.add(m_sub.group(1).lower())
                     continue
                 m_fun = re.match(
-                    r"^(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|double\s+precision)\s+)?function\s+([a-z_]\w*)\b",
+                    rf"^(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|{_CHAR_DECL_RE}|complex(?:\s*\([^)]*\))?|double\s+precision)\s+)?function\s+([a-z_]\w*)\b",
                     low,
                 )
                 if m_fun:
@@ -635,7 +645,7 @@ def find_implicit_none_undeclared_identifiers(
                 t = tok.lower()
                 if t in kw_arg_names:
                     continue
-                if t in known_decl or t in keywords or t in intrinsics:
+                if t in known_decl or t in known or t in defined_operator_names or t in keywords or t in intrinsics:
                     continue
                 if re.fullmatch(r"[de]\d*", t):
                     continue
@@ -666,6 +676,12 @@ def find_implicit_none_undeclared_identifiers(
                 if associate_name_stack:
                     for nm in associate_name_stack.pop():
                         active_associate_names.discard(nm)
+                continue
+            if re.match(r"^(?:[a-z_]\w*\s*:\s*)?block\s*$", low):
+                continue
+            if re.match(r"^end\s+block(?:\s+[a-z_]\w*)?\s*$", low):
+                continue
+            if re.match(r"^where\s*\(.+\)\s+.+$", low):
                 continue
             if low in {"implicit none", "contains"} or re.match(r"^use\b", low):
                 continue
@@ -734,7 +750,7 @@ def find_implicit_none_undeclared_identifiers(
                 t = tok.lower()
                 if call_callee and t == call_callee:
                     continue
-                if t in known_decl or t in active_associate_names or t in keywords or t in intrinsics or t in known:
+                if t in known_decl or t in active_associate_names or t in defined_operator_names or t in keywords or t in intrinsics or t in known:
                     continue
                 if t in kw_arg_names:
                     continue
@@ -747,13 +763,14 @@ def find_implicit_none_undeclared_identifiers(
     return errs
 
 
-def validate_fortran_basic_statements(text: str) -> List[str]:
+def validate_fortran_basic_statements(text: str, *, std: str = "") -> List[str]:
     """Return unrecognized-statement diagnostics for a basic free-form subset."""
     errs: List[str] = []
     lines = text.splitlines()
     unit_stack: List[Tuple[str, str, int]] = []  # (kind, name, start_line)
     in_implicit_main = False
     interface_depth = 0
+    strict_f2023 = std.lower() == "f2023"
 
     def _balanced_parens(s: str) -> bool:
         depth = 0
@@ -785,6 +802,9 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
             continue
         s_norm = re.sub(r"^\d+\s+", "", s, count=1)
         low = s_norm.lower()
+        if strict_f2023 and re.match(r"^call\s+getcwd(?:\s*\(.*\))?\s*$", low):
+            errs.append(f"line {lineno}: extension not allowed in f2023 mode: {s}")
+            continue
         if not _balanced_parens(s):
             errs.append(f"line {lineno}: unbalanced parentheses in statement: {s}")
             continue
@@ -842,12 +862,12 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
                 errs.append(f"line {lineno}: unexpected end program")
             continue
         m_fun = re.match(
-            r"^(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|double\s+precision)\s+)?function\s+[a-z_]\w*(?:\s*\([^)]*\))?\s*(?:result\s*\(\s*[a-z_]\w*\s*\))?\s*$",
+            rf"^(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|{_CHAR_DECL_RE}|complex(?:\s*\([^)]*\))?|double\s+precision)\s+)?function\s+[a-z_]\w*(?:\s*\([^)]*\))?\s*(?:result\s*\(\s*[a-z_]\w*\s*\))?\s*$",
             low,
         )
         if m_fun:
             m_name = re.match(
-                r"^(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|double\s+precision)\s+)?function\s+([a-z_]\w*)\b",
+                rf"^(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|{_CHAR_DECL_RE}|complex(?:\s*\([^)]*\))?|double\s+precision)\s+)?function\s+([a-z_]\w*)\b",
                 low,
             )
             if m_name:
@@ -892,8 +912,12 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
             if not unit_stack:
                 in_implicit_main = True
             continue
+        if re.match(r"^character\b", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
         if re.match(
-            r"^(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|type(?:\s*\([^)]*\))?|class(?:\s*\([^)]*\))?|double\s+precision)(?=\s|,|::|$)(?:(?:\s*,\s*.*?)?\s*::\s*.+|\s+.+)$",
+            rf"^(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|{_CHAR_DECL_RE}|complex(?:\s*\([^)]*\))?|type(?:\s*\([^)]*\))?|class(?:\s*\([^)]*\))?|double\s+precision)(?=\s|,|::|$)(?:(?:\s*,\s*.*?)?\s*::\s*.+|\s+.+)$",
             low,
         ):
             if not unit_stack:
@@ -1095,6 +1119,18 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
             if not unit_stack:
                 in_implicit_main = True
             continue
+        if re.match(r"^where\s*\(.+\)\s+.+$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
+        if re.match(r"^(?:[a-z_]\w*\s*:\s*)?block\s*$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
+        if re.match(r"^end\s+block(?:\s+[a-z_]\w*)?\s*$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
         if re.match(r"^associate\s*\(.*\)\s*$", low):
             if not unit_stack:
                 in_implicit_main = True
@@ -1115,7 +1151,7 @@ def validate_fortran_basic_statements(text: str) -> List[str]:
             if not unit_stack:
                 in_implicit_main = True
             continue
-        if re.match(r"^[a-z_]\w*(?:\s*\([^)]*\))?(?:\s*%\s*[a-z_]\w*(?:\s*\([^)]*\))?)*\s*=\s*.+$", low):
+        if re.match(rf"^{_ASSIGN_LHS_RE}\s*=\s*.+$", low):
             if not unit_stack:
                 in_implicit_main = True
             continue
@@ -1222,7 +1258,7 @@ def parse_declared_names_from_decl(line: str) -> Set[str]:
         #   double precision x
         #   real(kind=dp) a, b
         m = re.match(
-            r"^\s*(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|character(?:\s*\([^)]*\))?|complex(?:\s*\([^)]*\))?|double\s+precision|type\s*\([^)]*\)|class\s*\([^)]*\))(?:\s*,\s*.*?)?\s+(.+)$",
+            rf"^\s*(?:integer(?:\s*\([^)]*\))?|real(?:\s*\([^)]*\))?|logical|{_CHAR_DECL_RE}|complex(?:\s*\([^)]*\))?|double\s+precision|type\s*\([^)]*\)|class\s*\([^)]*\))(?:\s*,\s*.*?)?\s+(.+)$",
             line,
             re.IGNORECASE,
         )
@@ -5665,7 +5701,7 @@ def avoid_reserved_identifier_definitions(
     """Rename defined procedures/declared entities that collide with reserved names."""
     bad = {x.lower() for x in (forbidden or FORTRAN_RESERVED_IDENTIFIERS)}
     proc_re = re.compile(
-        r"^\s*(?:(?:double\s+precision|integer|real|logical|complex|character\b(?:\s*\([^)]*\))?|type\s*\([^)]*\)|class\s*\([^)]*\))\s*(?:\([^)]*\))?\s*,?\s*)?(?:(?:pure|elemental|impure|recursive|module)\s+)*(function|subroutine)\s+([a-z][a-z0-9_]*)\b",
+        rf"^\s*(?:(?:double\s+precision|integer|real|logical|complex|{_CHAR_DECL_RE}|type\s*\([^)]*\)|class\s*\([^)]*\))\s*(?:\([^)]*\))?\s*,?\s*)?(?:(?:pure|elemental|impure|recursive|module)\s+)*(function|subroutine)\s+([a-z][a-z0-9_]*)\b",
         re.IGNORECASE,
     )
     defined: Set[str] = set()

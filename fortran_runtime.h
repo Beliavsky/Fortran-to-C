@@ -2,6 +2,7 @@
 #define FORTRAN_RUNTIME_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 int len_trim_s(const char *s); /* Return the length after removing trailing blanks. */
 const char *trim_s(const char *s); /* Copy the string without trailing blanks. */
@@ -20,6 +21,10 @@ int scan_s(const char *s, const char *set); /* Return the 1-based location of th
 int verify_s(const char *s, const char *set); /* Return the 1-based location of the first character not in set. */
 const char *achar_s(int code); /* Build a one-character string from an integer code. */
 int iachar_s(const char *s); /* Return the code of the first character, or zero for empty input. */
+int getcwd_s(char *dst, int len); /* Fill a CHARACTER buffer with the current working directory. */
+void set_command_args_s(int argc, char **argv); /* Record the process command line for get_command_argument/command_argument_count. */
+int command_argument_count_s(void); /* Return the number of command arguments excluding argv[0]. */
+void get_command_argument_s(int idx, char *dst, int len); /* Copy argv[idx] into a CHARACTER buffer or blank-fill if unavailable. */
 
 int open_unit(int unit, const char *file, const char *action, const char *status); /* Open a file and bind it to a simple logical-unit table entry. */
 int close_unit(int unit); /* Close the file currently associated with a logical unit number. */

@@ -480,6 +480,7 @@ def main() -> int:
     ap.add_argument("--pretty", action="store_true", help="Normalize printed program output for display only.")
     ap.add_argument("--no-validate", action="store_true", help="Skip Fortran pre-validation checks before transpilation.")
     ap.add_argument("--max-errors", type=int, default=20, help="Maximum number of diagnostics to show for transpilation/validation errors; 0 means unlimited.")
+    ap.add_argument("--std", default="", help="Language mode for xf2c validation, for example --std=f2023.")
     form_group = ap.add_mutually_exclusive_group()
     form_group.add_argument("--free-form", action="store_true", help="Treat the main input source as free-form Fortran regardless of extension.")
     form_group.add_argument("--fixed-form", action="store_true", help="Treat the main input source as fixed-form Fortran regardless of extension.")
@@ -556,6 +557,17 @@ def main() -> int:
         if args.pretty and _NORMALIZE_TEXT is not None:
             return _NORMALIZE_TEXT(text, 1e-5, 4).rstrip()
         return text.rstrip()
+
+    def _normalize_exe_name_diff(text: str, src_path: Path) -> str:
+        if not text:
+            return text
+        stem = src_path.stem
+        out = text
+        out = re.sub(rf"(?i)\b{re.escape(stem)}\.orig\.exe\b", f"{stem}.exe", out)
+        out = re.sub(rf"(?i)\btemp_{re.escape(stem)}\.exe\b", f"{stem}.exe", out)
+        while "\\\\" in out:
+            out = out.replace("\\\\", "\\")
+        return out
 
     def _render_limited(text: str) -> str:
         stripped = text.rstrip()
@@ -736,6 +748,7 @@ def main() -> int:
                 validate=(not args.no_validate),
                 annotate=args.annotate,
                 max_errors=args.max_errors,
+                std=args.std,
             )
             if do_postprocess:
                 c_src = postprocess_c_text(c_src)
@@ -800,8 +813,8 @@ def main() -> int:
                     return rc
                 continue
             if args.run_diff and do_run_fortran and do_run_c:
-                f_cmp_out = _render_stdout(fortran_run_out)
-                c_cmp_out = _render_stdout(c_run_out)
+                f_cmp_out = _normalize_exe_name_diff(_render_stdout(fortran_run_out), src_path)
+                c_cmp_out = _normalize_exe_name_diff(_render_stdout(c_run_out), src_path)
                 f_cmp_err = fortran_run_err.rstrip()
                 c_cmp_err = c_run_err.rstrip()
                 if f_cmp_out == c_cmp_out and f_cmp_err == c_cmp_err:

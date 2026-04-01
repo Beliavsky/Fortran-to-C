@@ -5,6 +5,14 @@
 #include <stdint.h>
 #include <string.h>
 #include <ctype.h>
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <unistd.h>
+#endif
+
+static int saved_argc = 0;
+static char **saved_argv = NULL;
 
 int read_first_int_s(const char *s, int *out);
 int read_first_float_s(const char *s, float *out);
@@ -241,6 +249,46 @@ const char *achar_s(int code) {
 int iachar_s(const char *s) {
    /* Return the code of the first character, or zero for empty input. */
    return (s && s[0] != '\0') ? (int) ((unsigned char) s[0]) : 0;
+}
+
+
+int getcwd_s(char *dst, int len) {
+   /* Fill a fixed-length CHARACTER target with the current working directory. */
+   char *cwd = NULL;
+   if (!dst || len < 0) return -1;
+#ifdef _WIN32
+   cwd = _getcwd(NULL, 0);
+#else
+   cwd = getcwd(NULL, 0);
+#endif
+   if (!cwd) {
+      assign_str(dst, len, "");
+      return -1;
+   }
+   assign_str(dst, len, cwd);
+   free(cwd);
+   return 0;
+}
+
+
+void set_command_args_s(int argc, char **argv) {
+   /* Record argc/argv so any translated procedure can query command arguments. */
+   saved_argc = argc;
+   saved_argv = argv;
+}
+
+
+int command_argument_count_s(void) {
+   /* Fortran excludes argv[0] from command_argument_count(). */
+   return saved_argc > 0 ? (saved_argc - 1) : 0;
+}
+
+
+void get_command_argument_s(int idx, char *dst, int len) {
+   /* Copy argv[idx] into a fixed-length CHARACTER target. */
+   if (!dst || len < 0) return;
+   if (idx >= 0 && idx < saved_argc && saved_argv != NULL) assign_str(dst, len, saved_argv[idx]);
+   else assign_str(dst, len, "");
 }
 
 
