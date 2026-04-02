@@ -1,3 +1,10 @@
+"""Batch-run xf2c over many Fortran source files.
+
+The default workflow reads file names from `fortran_files.txt`, invokes
+`xf2c.py` for each source, and summarizes pass/fail results. This is the
+project's quick regression runner for many small example programs.
+"""
+
 from __future__ import annotations
 
 import argparse

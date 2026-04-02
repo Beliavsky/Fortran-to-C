@@ -377,10 +377,11 @@ def find_implicit_none_undeclared_identifiers(
     keywords = {
         "do", "end", "if", "then", "else", "call", "print", "write", "read",
         "open", "close", "rewind", "backspace", "result", "function", "subroutine", "program", "module", "contains",
-        "use", "only", "implicit", "none", "intent", "in", "out", "inout", "return",
+        "use", "only", "implicit", "none", "intent", "in", "out", "inout", "value", "return",
         "real", "integer", "logical", "character", "complex", "type", "class",
         "kind", "len", "parameter", "optional", "double", "precision", "select", "case", "default", "procedure",
         "save", "external", "dimension", "allocatable", "pointer", "target", "exit", "cycle", "stop", "error", "and", "or", "not", "eqv", "neqv",
+        "pause", "bind",
         "intrinsic", "public", "private", "generic",
         "true", "false", "while", "block", "where", "elsewhere",
     }
@@ -389,10 +390,11 @@ def find_implicit_none_undeclared_identifiers(
         "sum", "size", "shape", "lbound", "ubound", "allocated", "max", "min", "minval", "maxval", "matmul", "transpose", "huge",
         "sin", "cos", "acos", "asin", "atan", "tan",
         "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
-        "abs", "exp", "log", "gamma", "log_gamma", "random_number", "random_seed", "present", "product", "epsilon",
+        "abs", "exp", "log", "gamma", "log_gamma", "random_number", "random_seed", "date_and_time", "system_clock", "command_argument_count", "present", "product", "epsilon",
         "reshape", "spread", "pack", "count", "any", "all", "dot_product", "index", "len_trim", "norm2",
         "minloc", "maxloc", "findloc",
         "merge", "rank", "trim", "adjustl", "adjustr", "repeat", "scan", "verify", "achar", "char", "iachar", "new_line",
+        "compiler_version", "compiler_options",
         "cmplx", "conjg", "aimag",
         "iand", "ior", "ieor", "ishft",
         "selected_real_kind", "selected_int_kind", "digits", "tiny", "maxexponent", "minexponent", "precision", "radix", "range", "bit_size",
@@ -802,7 +804,16 @@ def validate_fortran_basic_statements(text: str, *, std: str = "") -> List[str]:
             continue
         s_norm = re.sub(r"^\d+\s+", "", s, count=1)
         low = s_norm.lower()
+        if strict_f2023 and re.match(
+            r"^(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:real|integer|complex|character)\s*\*\s*\d+\b",
+            low,
+        ):
+            errs.append(f"line {lineno}: extension not allowed in f2023 mode: {s}")
+            continue
         if strict_f2023 and re.match(r"^call\s+getcwd(?:\s*\(.*\))?\s*$", low):
+            errs.append(f"line {lineno}: extension not allowed in f2023 mode: {s}")
+            continue
+        if strict_f2023 and re.match(r"^pause(?:\s*(?:\(\s*[^)]*\s*\)|.+))?\s*$", low):
             errs.append(f"line {lineno}: extension not allowed in f2023 mode: {s}")
             continue
         if not _balanced_parens(s):
@@ -904,7 +915,7 @@ def validate_fortran_basic_statements(text: str, *, std: str = "") -> List[str]:
             else:
                 errs.append(f"line {lineno}: unexpected end subroutine")
             continue
-        if low == "implicit none":
+        if low == "implicit none" or re.match(r"^implicit\s+.+$", low):
             if not unit_stack:
                 in_implicit_main = True
             continue
@@ -1107,6 +1118,10 @@ def validate_fortran_basic_statements(text: str, *, std: str = "") -> List[str]:
             if not unit_stack:
                 in_implicit_main = True
             continue
+        if re.match(r"^pause(?:\s*(?:\(\s*[^)]*\s*\)|.+))?\s*$", low):
+            if not unit_stack:
+                in_implicit_main = True
+            continue
         if re.match(r"^forall\s*\(.*\)\s*$", low):
             if not unit_stack:
                 in_implicit_main = True
@@ -1158,6 +1173,32 @@ def validate_fortran_basic_statements(text: str, *, std: str = "") -> List[str]:
         errs.append(f"line {lineno}: unrecognized statement: {s}")
     for kind, name, start_line in reversed(unit_stack):
         errs.append(f"line {start_line}: unterminated {kind} '{name}'")
+    return errs
+
+
+def validate_fortran_source_extensions(text: str, *, std: str = "") -> List[str]:
+    """Reject raw-source extensions that may be normalized away before validation."""
+    if std.lower() != "f2023":
+        return []
+    errs: List[str] = []
+    for lineno, stmt in iter_fortran_statements(text.splitlines()):
+        s = stmt.strip()
+        if not s:
+            continue
+        s_norm = re.sub(r"^\d+\s+", "", s, count=1)
+        low = s_norm.lower()
+        if re.match(
+            r"^(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:real|integer|complex|character)\s*\*\s*\d+\b",
+            low,
+        ):
+            errs.append(f"line {lineno}: extension not allowed in f2023 mode: {s}")
+            continue
+        if re.match(r"^call\s+getcwd(?:\s*\(.*\))?\s*$", low):
+            errs.append(f"line {lineno}: extension not allowed in f2023 mode: {s}")
+            continue
+        if re.match(r"^pause(?:\s*(?:\(\s*[^)]*\s*\)|.+))?\s*$", low):
+            errs.append(f"line {lineno}: extension not allowed in f2023 mode: {s}")
+            continue
     return errs
 
 
@@ -2235,7 +2276,7 @@ def _expr_is_declared_integer(expr: str, int_names: Set[str]) -> bool:
 
     integer_intrinsics = {
         "int", "nint", "floor", "ceiling", "size", "lbound", "ubound", "len", "kind", "rank", "count", "index",
-        "len_trim", "scan", "verify", "iachar", "minloc", "maxloc", "findloc", "selected_real_kind", "selected_int_kind",
+        "len_trim", "scan", "verify", "iachar", "minloc", "maxloc", "findloc", "selected_real_kind", "selected_int_kind", "command_argument_count",
         "digits", "maxexponent", "minexponent", "precision", "radix", "range", "bit_size", "exponent", "storage_size",
     }
 
@@ -5410,6 +5451,44 @@ def _line_eol(line: str) -> str:
     return ""
 
 
+def normalize_optional_space_keywords(text: str) -> str:
+    """Normalize common free-form keyword spellings where spaces are optional.
+
+    Examples:
+    - ``elseif (...) then`` -> ``else if (...) then``
+    - ``endif`` -> ``end if``
+    - ``enddo`` -> ``end do``
+    """
+    replacements = [
+        (re.compile(r"^\s*elseif\b", re.IGNORECASE), "else if"),
+        (re.compile(r"^\s*endif\b", re.IGNORECASE), "end if"),
+        (re.compile(r"^\s*enddo\b", re.IGNORECASE), "end do"),
+        (re.compile(r"^\s*endwhere\b", re.IGNORECASE), "end where"),
+        (re.compile(r"^\s*endforall\b", re.IGNORECASE), "end forall"),
+        (re.compile(r"^\s*endassociate\b", re.IGNORECASE), "end associate"),
+        (re.compile(r"^\s*endselect\b", re.IGNORECASE), "end select"),
+        (re.compile(r"^\s*endblock\b", re.IGNORECASE), "end block"),
+        (re.compile(r"^\s*endtype\b", re.IGNORECASE), "end type"),
+        (re.compile(r"^\s*endmodule\b", re.IGNORECASE), "end module"),
+        (re.compile(r"^\s*endprogram\b", re.IGNORECASE), "end program"),
+        (re.compile(r"^\s*endsubroutine\b", re.IGNORECASE), "end subroutine"),
+        (re.compile(r"^\s*endfunction\b", re.IGNORECASE), "end function"),
+        (re.compile(r"^\s*endinterface\b", re.IGNORECASE), "end interface"),
+    ]
+    out: List[str] = []
+    for raw in text.splitlines(keepends=True):
+        eol = _line_eol(raw)
+        body = raw[:-len(eol)] if eol else raw
+        code, comment = _split_code_comment(body)
+        for pat, repl in replacements:
+            m = pat.match(code)
+            if m:
+                code = f"{code[:m.start()]}{repl}{code[m.end():]}"
+                break
+        out.append(f"{code}{comment}{eol}")
+    return "".join(out)
+
+
 def rewrite_decl_remove_names(line: str, remove_names: Set[str]) -> Tuple[Optional[str], bool]:
     """Remove selected entity names from one declaration line."""
     code, comment = _split_code_comment(line.rstrip("\r\n"))
@@ -5644,7 +5723,7 @@ FORTRAN_RESERVED_IDENTIFIERS: Set[str] = {
     # common intrinsics often collided in transpiled names
     "sum", "product", "minval", "maxval", "matmul", "transpose", "dot_product",
     "reshape", "spread", "pack", "count", "norm2", "abs", "sqrt", "floor", "mod",
-    "int", "real", "size", "lbound", "ubound", "merge", "random_number", "random_seed",
+    "int", "real", "size", "lbound", "ubound", "merge", "random_number", "random_seed", "date_and_time",
 }
 
 
@@ -5798,6 +5877,8 @@ def _rhs_has_disallowed_calls(rhs: str, declared: Set[str]) -> bool:
         "char",
         "iachar",
         "storage_size",
+        "compiler_version",
+        "compiler_options",
     }
     for m in re.finditer(r"([a-z][a-z0-9_]*)\s*\(", rhs, re.IGNORECASE):
         name = m.group(1).lower()
@@ -6363,13 +6444,14 @@ def rewrite_named_arguments_in_statement(
     intrinsic_ignore = {
         "abs", "acos", "acosd", "acosh", "aimag", "aint", "all", "anint", "any", "asin", "asind", "asinh", "atan", "atan2", "atanh",
         "bessel_j0", "bessel_j1", "bessel_y0", "bessel_y1",
-        "ceiling", "cmplx", "conjg", "cos", "cosd", "cosh", "count", "cpu_time", "dble", "digits",
+        "ceiling", "cmplx", "conjg", "cos", "cosd", "cosh", "count", "cpu_time", "date_and_time", "system_clock", "dble", "digits",
         "dot_product", "epsilon", "exp", "floor", "huge", "iachar", "ichar", "index", "int",
         "kind", "len", "log", "log10", "log_gamma", "matmul", "max", "maxval", "merge", "min", "minval",
         "mod", "nint", "pack", "present", "product", "real", "reshape", "scan", "verify", "adjustl", "adjustr", "repeat", "achar", "char", "iachar", "selected_int_kind",
         "selected_real_kind", "shape", "sign", "sin", "sind", "sinh", "size", "spacing", "spread", "sqrt", "storage_size",
-        "sum", "tan", "tand", "tanh", "tiny", "trim", "ubound", "lbound", "minloc", "maxloc", "findloc", "gamma",
+        "sum", "tan", "tand", "tanh", "tiny", "trim", "ubound", "lbound", "minloc", "maxloc", "findloc", "gamma", "command_argument_count", "system_clock",
         "maxexponent", "minexponent", "precision", "radix", "range", "bit_size", "nearest", "exponent", "fraction", "set_exponent", "scale",
+        "compiler_version", "compiler_options",
     }
     segments = _find_call_like_segments(code)
     if not segments:

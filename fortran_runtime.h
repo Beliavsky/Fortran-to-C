@@ -22,9 +22,18 @@ int verify_s(const char *s, const char *set); /* Return the 1-based location of 
 const char *achar_s(int code); /* Build a one-character string from an integer code. */
 int iachar_s(const char *s); /* Return the code of the first character, or zero for empty input. */
 int getcwd_s(char *dst, int len); /* Fill a CHARACTER buffer with the current working directory. */
+void pause_s(const char *msg); /* Implement legacy PAUSE by printing an optional message and waiting for Enter. */
 void set_command_args_s(int argc, char **argv); /* Record the process command line for get_command_argument/command_argument_count. */
 int command_argument_count_s(void); /* Return the number of command arguments excluding argv[0]. */
 void get_command_argument_s(int idx, char *dst, int len); /* Copy argv[idx] into a CHARACTER buffer or blank-fill if unavailable. */
+void get_command_argument_full_s(int idx, char *dst, int len, int *len_out, int *status_out); /* Copy argv[idx] and report effective length/status for GET_COMMAND_ARGUMENT. */
+const char *compiler_version_s(void); /* Return a short xf2c/compiler description string. */
+const char *compiler_options_s(void); /* Return a short compiler-options description string. */
+void date_and_time_s(char *date, int date_len, char *time_s, int time_len, char *zone, int zone_len, int *values, int nvalues); /* Fill DATE_AND_TIME outputs for any present arguments. */
+double cpu_time_s(void); /* Return process CPU time in seconds. */
+int64_t system_clock_count_s(void); /* Return the current SYSTEM_CLOCK count using a monotonic millisecond clock. */
+int64_t system_clock_count_rate_s(void); /* Return the SYSTEM_CLOCK tick rate. */
+int64_t system_clock_count_max_s(void); /* Return the SYSTEM_CLOCK wraparound maximum. */
 
 int open_unit(int unit, const char *file, const char *action, const char *status); /* Open a file and bind it to a simple logical-unit table entry. */
 int close_unit(int unit); /* Close the file currently associated with a logical unit number. */
@@ -43,6 +52,7 @@ int write_first_int_unit(int unit, int v); /* Write one list-directed INTEGER it
 int write_first_float_unit(int unit, float v); /* Write one list-directed REAL item to an external unit. */
 int write_first_double_unit(int unit, double v); /* Write one list-directed DOUBLE PRECISION item to an external unit. */
 int read_a(int unit, char *buf, int len); /* Read one character record and blank-pad the destination buffer. */
+int read_a_stdin(char *buf, int len); /* Read one character record from standard input and blank-pad the destination buffer. */
 int skip_record_unit(int unit); /* Read and discard one text record from an external unit. */
 int read_int_float_record(int unit, int *iv, float *rv); /* Read one whitespace-separated INTEGER/REAL text record. */
 int read_int_double_record(int unit, int *iv, double *rv); /* Read one whitespace-separated INTEGER/DOUBLE text record. */
@@ -50,6 +60,7 @@ int read_first_int_unit(int unit, int *out); /* Read the leading INTEGER item fr
 int read_first_float_unit(int unit, float *out); /* Read the leading REAL item from an external list-directed record. */
 int read_first_double_unit(int unit, double *out); /* Read the leading DOUBLE PRECISION item from an external list-directed record. */
 int read_words_unit(int unit, int nw, char **words); /* Read one external list-directed record as nw whitespace-delimited words. */
+int read_words_after_int_unit(int unit, int nw, char **words); /* Read one external list-directed record containing an initial count followed by nw words. */
 int read_int_s(const char *s, int *out); /* Parse a scalar INTEGER from an internal character buffer. */
 int read_float_s(const char *s, float *out); /* Parse a scalar REAL from an internal character buffer. */
 int read_double_s(const char *s, double *out); /* Parse a scalar DOUBLE PRECISION value from an internal character buffer. */

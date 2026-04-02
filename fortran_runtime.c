@@ -5,8 +5,10 @@
 #include <stdint.h>
 #include <string.h>
 #include <ctype.h>
+#include <time.h>
 #ifdef _WIN32
 #include <direct.h>
+#include <windows.h>
 #else
 #include <unistd.h>
 #endif
@@ -271,6 +273,16 @@ int getcwd_s(char *dst, int len) {
 }
 
 
+void pause_s(const char *msg) {
+   /* Implement legacy PAUSE by prompting and waiting for one input record. */
+   char buf[8];
+   if (msg && *msg) fprintf(stdout, "%s\n", msg);
+   fprintf(stdout, "PAUSE: press Enter to continue\n");
+   fflush(stdout);
+   (void) fgets(buf, (int) sizeof(buf), stdin);
+}
+
+
 void set_command_args_s(int argc, char **argv) {
    /* Record argc/argv so any translated procedure can query command arguments. */
    saved_argc = argc;
@@ -292,12 +304,174 @@ void get_command_argument_s(int idx, char *dst, int len) {
 }
 
 
+void get_command_argument_full_s(int idx, char *dst, int len, int *len_out, int *status_out) {
+   /* Copy argv[idx] and report effective length/status like GET_COMMAND_ARGUMENT. */
+   const char *src = "";
+   int status = 0;
+   int arg_len = 0;
+   if (idx >= 0 && idx < saved_argc && saved_argv != NULL) {
+      src = saved_argv[idx] ? saved_argv[idx] : "";
+      arg_len = (int) strlen(src);
+      if (dst && len >= 0 && arg_len > len) status = -1;
+   } else {
+      status = 1;
+   }
+   if (dst && len >= 0) assign_str(dst, len, src);
+   if (len_out) *len_out = arg_len;
+   if (status_out) *status_out = status;
+}
+
+
+const char *compiler_version_s(void) {
+   /* Report the translated-C compiler family in a stable xf2c-specific string. */
+#ifdef __clang__
+   return "xf2c via clang";
+#elif defined(__GNUC__)
+   return "xf2c via gcc";
+#else
+   return "xf2c via c";
+#endif
+}
+
+
+const char *compiler_options_s(void) {
+   /* Keep this conservative: report the C compiler family, not guessed Fortran flags. */
+#ifdef __clang__
+   return "via clang";
+#elif defined(__GNUC__)
+   return "via gcc";
+#else
+   return "";
+#endif
+}
+
+
+void date_and_time_s(char *date, int date_len, char *time_s, int time_len, char *zone, int zone_len, int *values, int nvalues) {
+   /* Fill DATE_AND_TIME outputs from the current local wall clock. */
+   time_t secs;
+   struct tm local_tm;
+   int msec = 0;
+   int offset_min = 0;
+   char buf[32];
+#ifdef _WIN32
+   SYSTEMTIME st;
+   TIME_ZONE_INFORMATION tzi;
+   DWORD tzid;
+   GetLocalTime(&st);
+   memset(&local_tm, 0, sizeof(local_tm));
+   local_tm.tm_year = st.wYear - 1900;
+   local_tm.tm_mon = st.wMonth - 1;
+   local_tm.tm_mday = st.wDay;
+   local_tm.tm_hour = st.wHour;
+   local_tm.tm_min = st.wMinute;
+   local_tm.tm_sec = st.wSecond;
+   msec = st.wMilliseconds;
+   tzid = GetTimeZoneInformation(&tzi);
+   offset_min = -(int) tzi.Bias;
+   if (tzid == TIME_ZONE_ID_STANDARD) offset_min -= (int) tzi.StandardBias;
+   else if (tzid == TIME_ZONE_ID_DAYLIGHT) offset_min -= (int) tzi.DaylightBias;
+#else
+#if defined(TIME_UTC)
+   {
+      struct timespec ts;
+   if (timespec_get(&ts, TIME_UTC) == TIME_UTC) {
+      secs = ts.tv_sec;
+      msec = (int) (ts.tv_nsec / 1000000L);
+   } else {
+      secs = time(NULL);
+   }
+   }
+#else
+   secs = time(NULL);
+#endif
+   localtime_r(&secs, &local_tm);
+   {
+      struct tm utc_tm;
+      gmtime_r(&secs, &utc_tm);
+      time_t local_epoch = mktime(&local_tm);
+      time_t utc_as_local_epoch = mktime(&utc_tm);
+      offset_min = (int) ((local_epoch - utc_as_local_epoch) / 60);
+   }
+#endif
+   if (date) {
+      snprintf(buf, sizeof(buf), "%04d%02d%02d",
+               local_tm.tm_year + 1900, local_tm.tm_mon + 1, local_tm.tm_mday);
+      assign_str(date, date_len, buf);
+   }
+   if (time_s) {
+      snprintf(buf, sizeof(buf), "%02d%02d%02d.%03d",
+               local_tm.tm_hour, local_tm.tm_min, local_tm.tm_sec, msec);
+      assign_str(time_s, time_len, buf);
+   }
+   if (zone) {
+      int off = offset_min;
+      char sign = '+';
+      if (off < 0) {
+         sign = '-';
+         off = -off;
+      }
+      snprintf(buf, sizeof(buf), "%c%02d%02d", sign, off / 60, off % 60);
+      assign_str(zone, zone_len, buf);
+   }
+   if (values && nvalues > 0) {
+      int vals[8] = {
+         local_tm.tm_year + 1900,
+         local_tm.tm_mon + 1,
+         local_tm.tm_mday,
+         offset_min,
+         local_tm.tm_hour,
+         local_tm.tm_min,
+         local_tm.tm_sec,
+         msec,
+      };
+      int ncopy = nvalues < 8 ? nvalues : 8;
+      for (int i = 0; i < ncopy; ++i) values[i] = vals[i];
+   }
+}
+
+
+double cpu_time_s(void) {
+   return ((double) clock()) / ((double) CLOCKS_PER_SEC);
+}
+
+
+int64_t system_clock_count_s(void) {
+   uint64_t tick_ms = 0;
+#ifdef _WIN32
+   tick_ms = (uint64_t) GetTickCount64();
+#else
+   struct timespec ts;
+#if defined(CLOCK_MONOTONIC)
+   if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+      tick_ms = (uint64_t) ts.tv_sec * 1000u + (uint64_t) (ts.tv_nsec / 1000000L);
+   } else
+#endif
+   {
+      time_t secs = time(NULL);
+      tick_ms = (uint64_t) secs * 1000u;
+   }
+#endif
+   return (int64_t) (tick_ms % ((uint64_t) INT_MAX + 1u));
+}
+
+
+int64_t system_clock_count_rate_s(void) {
+   return 1000;
+}
+
+
+int64_t system_clock_count_max_s(void) {
+   return INT_MAX;
+}
+
+
 static FILE *unit_files[1000] = {0};
 static char unit_names[1000][4097] = {{0}};
 static char unit_access[1000][32] = {{0}};
 static char unit_form[1000][32] = {{0}};
 static char unit_action[1000][32] = {{0}};
 static const char *skip_space_s(const char *s);
+int read_words_after_int_s(const char *s, int nw, char **words);
 
 
 static FILE *unit_get(int unit) {
@@ -535,6 +709,22 @@ int read_a(int unit, char *buf, int len) {
 }
 
 
+int read_a_stdin(char *buf, int len) {
+   /* Read one character record from stdin and blank-pad the destination buffer. */
+   if (!buf || len < 0) return 1;
+   for (int i = 0; i < len; ++i) buf[i] = ' ';
+   buf[len] = '\0';
+   if (!fgets(buf, len + 1, stdin)) return 1;
+   {
+      int n = (int) strlen(buf);
+      while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = '\0';
+      for (int i = n; i < len; ++i) buf[i] = ' ';
+      buf[len] = '\0';
+   }
+   return 0;
+}
+
+
 int skip_record_unit(int unit) {
    /* Read and discard one text record from an external unit. */
    FILE *fp = unit_get(unit);
@@ -632,6 +822,16 @@ int read_words_unit(int unit, int nw, char **words) {
    }
    src = skip_space_s(src);
    return (src && *src == '\0') ? 0 : 1;
+}
+
+
+int read_words_after_int_unit(int unit, int nw, char **words) {
+   /* Read one external list-directed record containing an initial count followed by nw words. */
+   char buf[8192];
+   FILE *fp = unit_get(unit);
+   if (!fp || nw < 0 || (nw > 0 && !words)) return 1;
+   if (!fgets(buf, (int) sizeof(buf), fp)) return 1;
+   return read_words_after_int_s(buf, nw, words);
 }
 
 

@@ -567,6 +567,19 @@ def main() -> int:
         out = re.sub(rf"(?i)\btemp_{re.escape(stem)}\.exe\b", f"{stem}.exe", out)
         while "\\\\" in out:
             out = out.replace("\\\\", "\\")
+        lines = out.splitlines()
+        for i, line in enumerate(lines):
+            m_val = re.match(r"^(\s*value\s*=\s*)(.*)$", line, re.IGNORECASE)
+            if not m_val:
+                continue
+            if i + 1 >= len(lines):
+                continue
+            m_len = re.match(r"^(\s*length\s*=\s*)[-+]?\d+\s*$", lines[i + 1], re.IGNORECASE)
+            if not m_len:
+                continue
+            value_text = m_val.group(2)
+            lines[i + 1] = f"{m_len.group(1)}{len(value_text)}"
+        out = "\n".join(lines)
         return out
 
     def _render_limited(text: str) -> str:

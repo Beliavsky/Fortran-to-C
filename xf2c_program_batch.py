@@ -1,3 +1,11 @@
+"""Batch-run xf2c over complete Fortran programs listed in manifest files.
+
+Each manifest is a `*_files.txt` file containing one Fortran source path per
+line in the order needed to build the original program with gfortran. The
+script combines the listed sources, runs `xf2c.py` on the target program file,
+and reports pass/fail plus optional timing and failure output.
+"""
+
 from __future__ import annotations
 
 import argparse
