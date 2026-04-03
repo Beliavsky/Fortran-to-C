@@ -9172,6 +9172,8 @@ def _parse_decls(
                 attrs = ""
                 is_external = False
                 is_alloc = False
+                is_ptr = False
+                is_target = False
                 dim_attr = None
             else:
                 assert m_real_attr is not None
@@ -9182,6 +9184,8 @@ def _parse_decls(
                 ents = m_real_attr.group(3)
                 is_external = "external" in attrs
                 is_alloc = "allocatable" in attrs
+                is_ptr = "pointer" in attrs
+                is_target = "target" in attrs
                 m_dim_attr = re.search(r"dimension\s*\(\s*([^)]+)\s*\)", attrs, re.IGNORECASE)
                 dim_attr = m_dim_attr.group(1).strip() if m_dim_attr else None
             kind_ct = real_type
@@ -9210,6 +9214,8 @@ def _parse_decls(
                         intent=intent,
                         is_external=is_external,
                         is_allocatable=is_alloc,
+                        is_pointer=is_ptr,
+                        is_target=is_target,
                         is_param=is_param,
                         is_save=is_save,
                         optional=is_optional,
@@ -9224,6 +9230,8 @@ def _parse_decls(
                         intent=intent,
                         is_external=is_external,
                         is_allocatable=is_alloc,
+                        is_pointer=is_ptr,
+                        is_target=is_target,
                         is_param=is_param,
                         is_save=is_save,
                         optional=is_optional,
@@ -9236,6 +9244,8 @@ def _parse_decls(
                         intent=intent,
                         is_external=is_external,
                         is_allocatable=is_alloc,
+                        is_pointer=is_ptr,
+                        is_target=is_target,
                         is_param=is_param,
                         is_save=is_save,
                         optional=is_optional,
@@ -16610,6 +16620,21 @@ def _transpile_unit(
                             out.append(" " * indent + f"{en} = 0;")
                     continue
                 if lv_ptr.is_array:
+                    m_col_ptr = re.match(
+                        r"^([a-z_]\w*)\s*\(\s*:\s*,\s*([^)]+)\s*\)$",
+                        rhs_ptr,
+                        re.IGNORECASE,
+                    )
+                    if m_col_ptr:
+                        base_nm = m_col_ptr.group(1).lower()
+                        base_v = vars_map.get(base_nm)
+                        dparts = _resolved_dim_parts(base_v, base_nm, assumed_extents) if base_v is not None else []
+                        if base_v is not None and base_v.is_array and len(dparts) == 2:
+                            col = _convert_expr(m_col_ptr.group(2).strip(), vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                            row_len = _convert_expr(dparts[0], vars_map, real_type, byref_scalars, assumed_extents, proc_arg_extent_names)
+                            out.append(" " * indent + f"{lhs_nm} = &{base_nm}[(({col}) - 1) * ({row_len})];")
+                            out.append(" " * indent + f"{_alloc_len_name(lhs_nm)} = {row_len};")
+                            continue
                     m_sec_ptr = re.match(
                         r"^([a-z_]\w*)\s*\(\s*([^:,\)]*)\s*:\s*([^:,\)]*)(?:\s*:\s*([^)]+))?\s*\)$",
                         rhs_ptr,
@@ -18770,7 +18795,7 @@ def _transpile_unit(
         out.append("}")
     else:
         for nm, v in vars_map.items():
-            if v.is_array and (v.is_allocatable or (unit["kind"] == "program" and _main_fixed_array_uses_heap(v))):
+            if v.is_array and ((v.is_allocatable) or (unit["kind"] == "program" and _main_fixed_array_uses_heap(v))):
                 if (v.ctype or "").lower() == "char *" and v.is_allocatable:
                     out.append(" " * indent + f"free_str_array({nm}, {_alloc_len_name(nm)});")
                 else:

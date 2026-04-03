@@ -1661,6 +1661,8 @@ def _rewrite_assignment_rhs(code: str) -> str:
     lhs = code[: assign_pos + 1]
     rhs = code[assign_pos + 1 : semi]
     raw_rhs = rhs.strip()
+    if re.search(r"\(\*\s*[A-Za-z_]\w*\s*\)", raw_rhs):
+        return code
     rhs_new = simplify_expr_text(raw_rhs)
     if rhs_new == raw_rhs:
         return code
@@ -1669,6 +1671,38 @@ def _rewrite_assignment_rhs(code: str) -> str:
 
 def _fix_stringified_nul_char_literal(code: str) -> str:
     return re.sub(r'=\s*"\\\\0"\s*;', "= '\\0';", code)
+
+
+def _rewrite_optional_pointer_present_checks(text: str) -> str:
+    pat = re.compile(
+        r'(#define\s+([a-z_]\w*)\s+\(\*\s*\2__arg\)\s*\n)(.*?)(\n\s*#undef\s+\2)',
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    def _sub(m: re.Match[str]) -> str:
+        prefix = m.group(1)
+        nm = m.group(2)
+        body = m.group(3)
+        suffix = m.group(4)
+        body = re.sub(rf"\b{re.escape(nm)}\s*!=\s*NULL", f"{nm}__arg != NULL", body, flags=re.IGNORECASE)
+        body = re.sub(rf"\b{re.escape(nm)}\s*==\s*NULL", f"{nm}__arg == NULL", body, flags=re.IGNORECASE)
+        return f"{prefix}{body}{suffix}"
+
+    return pat.sub(_sub, text)
+
+
+def _rewrite_trim_string_comparisons(text: str) -> str:
+    text = re.sub(
+        r'(?i)(trim_s\([^)]*\)|adjustl_s\([^)]*\)|adjustr_s\([^)]*\))\s*==\s*(trim_s\([^)]*\)|adjustl_s\([^)]*\)|adjustr_s\([^)]*\))',
+        r"strcmp(\1, \2) == 0",
+        text,
+    )
+    text = re.sub(
+        r'(?i)(trim_s\([^)]*\)|adjustl_s\([^)]*\)|adjustr_s\([^)]*\))\s*!=\s*(trim_s\([^)]*\)|adjustl_s\([^)]*\)|adjustr_s\([^)]*\))',
+        r"strcmp(\1, \2) != 0",
+        text,
+    )
+    return text
 
 
 def postprocess_c_line(line: str, rename_map: Optional[dict[str, str]] = None) -> str:
@@ -1681,6 +1715,7 @@ def postprocess_c_line(line: str, rename_map: Optional[dict[str, str]] = None) -
     code = _rewrite_bracket_exprs(code)
     code = _rewrite_paren_exprs(code)
     code = _rewrite_assignment_rhs(code)
+    code = re.sub(r"\bjoin_\(\s*1\s*,\s*", "join_(", code)
     code = _fix_stringified_nul_char_literal(code)
     return f"{code}{comment}{eol}"
 
@@ -1711,6 +1746,8 @@ def postprocess_c_text(text: str) -> str:
         if new_out == out:
             break
         out = new_out
+    out = _rewrite_optional_pointer_present_checks(out)
+    out = _rewrite_trim_string_comparisons(out)
     return out
 
 
