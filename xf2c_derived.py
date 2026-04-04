@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from xf2c_textutil import _split_args_top_level, _strip_comment
 
